@@ -25,7 +25,6 @@ func TestGenerateED25519Key(t *testing.T) {
 }
 
 func TestAddUserFromCLI(t *testing.T) {
-	users = nil
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
 	pubFile, err := os.CreateTemp("", "pubkey_*.pub")
 	if err != nil {
@@ -35,7 +34,7 @@ func TestAddUserFromCLI(t *testing.T) {
 	pubFile.Write([]byte("ssh-ed25519 " + string(pub)))
 	pubFile.Close()
 
-	err = addUserFromCLI("testuser", "testpass", pubFile.Name())
+	users, err := addUserFromCLI("testuser", "testpass", pubFile.Name())
 	if err != nil {
 		t.Fatalf("addUserFromCLI failed: %v", err)
 	}
@@ -45,8 +44,7 @@ func TestAddUserFromCLI(t *testing.T) {
 }
 
 func TestLoadConfig(t *testing.T) {
-	users = nil
-	jsonData := `{"users":[{"username":"a","password":"b","public_key":"c"}]}`
+	jsonData := `{"users":[{"user":"a","pwd":"b","public_key":"c"}]}`
 	tmpfile, err := os.CreateTemp("", "config_*.json")
 	if err != nil {
 		t.Fatalf("TempFile error: %v", err)
@@ -55,7 +53,8 @@ func TestLoadConfig(t *testing.T) {
 	tmpfile.Write([]byte(jsonData))
 	tmpfile.Close()
 
-	if err := loadConfig(tmpfile.Name()); err != nil {
+	users, err := loadConfig(tmpfile.Name())
+	if err != nil {
 		t.Fatalf("loadConfig failed: %v", err)
 	}
 	if len(users) != 1 || users[0].Username != "a" {

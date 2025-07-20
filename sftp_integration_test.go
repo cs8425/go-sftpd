@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"io"
 	"net"
 	"os"
@@ -20,21 +19,15 @@ func startTestServer(t *testing.T, addr, keyPath, rootDir string) net.Listener {
 	go func() {
 		privateBytes, _ := os.ReadFile(keyPath)
 		private, _ := ssh.ParsePrivateKey(privateBytes)
-		config := &ssh.ServerConfig{
-			PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-				if c.User() == "testuser" && string(pass) == "testpass" {
-					return &ssh.Permissions{}, nil
-				}
-				return nil, errors.New("unauthorized")
-			},
-		}
-		config.AddHostKey(private)
+		users := []*UserConfig{{Username: "testuser", Password: "testpass", HomeDir: ""}}
+		srv := NewSftpSrv(users, rootDir)
+		srv.config.AddHostKey(private)
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
-			go handleConn(conn, config, rootDir)
+			go srv.HandleConn(conn, rootDir)
 		}
 	}()
 	return listener

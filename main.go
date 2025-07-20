@@ -26,46 +26,131 @@ import (
 
 // UserConfig represents a user account
 type UserConfig struct {
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	PublicKey string `json:"public_key"`
+	Username  string `json:"user,omitempty"`
+	Password  string `json:"pwd,omitempty"`
+	PublicKey string `json:"public_key,omitempty"`
+	HomeDir   string `json:"home,omitempty"`
 }
 
 // Config represents the config file structure
 type Config struct {
-	Users []UserConfig `json:"users"`
+	Users []*UserConfig `json:"users"`
+}
+
+type SftpSrv struct {
+	config  *ssh.ServerConfig
+	rootDir string
+	Users   []*UserConfig
+}
+
+func NewSftpSrv(users []*UserConfig, rootDir string) *SftpSrv {
+	srv := &SftpSrv{
+		Users:   users,
+		rootDir: rootDir,
+	}
+	srv.config = &ssh.ServerConfig{
+		PasswordCallback:  srv.PasswordAuth,
+		PublicKeyCallback: srv.PublicKeyAuth,
+		ServerVersion:     "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.13",
+	}
+	return srv
+}
+
+func (srv *SftpSrv) GetUser(name string) *UserConfig {
+	for _, u := range srv.Users {
+		if u.Username == name {
+			return u
+		}
+	}
+	return nil
+}
+
+func (srv *SftpSrv) PasswordAuth(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+	for _, u := range srv.Users {
+		if subtle.ConstantTimeCompare([]byte(c.User()), []byte(u.Username)) == 1 &&
+			u.Password != "" && subtle.ConstantTimeCompare(pass, []byte(u.Password)) == 1 {
+			Vln(3, "Accept passwordAuth", string(c.ClientVersion()), c.RemoteAddr(), c.User(), c)
+			return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
+		}
+	}
+	return nil, fmt.Errorf("password rejected for %q", c.User())
+}
+
+func (srv *SftpSrv) PublicKeyAuth(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+	pubKeyData := base64.StdEncoding.EncodeToString(pubKey.Marshal())
+	for _, u := range srv.Users {
+		if u.Username == c.User() && u.PublicKey != "" {
+			// 支援 OpenSSH 格式與 base64 內容比對
+			if strings.Contains(u.PublicKey, pubKeyData) {
+				return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("public key rejected for %q", c.User())
+}
+
+func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
+	defer conn.Close()
+	sshConn, chans, reqs, err := ssh.NewServerConn(conn, srv.config)
+	if err != nil {
+		Vf(1, "Failed to handshake: %v", err)
+		return
+	}
+	defer sshConn.Close()
+	go ssh.DiscardRequests(reqs)
+
+	user := srv.GetUser(sshConn.User())
+	userRootDir := filepath.Join(rootDir, user.HomeDir)
+	Vln(3, "New SSH connection from", conn.RemoteAddr(), user, userRootDir)
+
+	for newChannel := range chans {
+		switch newChannel.ChannelType() {
+		case "session":
+			channel, requests, err := newChannel.Accept()
+			if err != nil {
+				Vf(1, "Could not accept channel: %v", err)
+				continue
+			}
+			Vln(3, "New session channel", channel)
+			go handleSession(channel, requests, userRootDir)
+		case "direct-tcpip":
+			go handleDirectTCPIP(newChannel)
+		case "forwarded-tcpip":
+			go handleForwardedTCPIP(newChannel)
+		default:
+			Vln(3, "New channel", newChannel.ChannelType(), newChannel.ExtraData())
+			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+		}
+	}
+	Vln(3, "SSH connection end", conn.RemoteAddr(), sshConn)
 }
 
 var (
 	verbosity = flag.Int("v", 3, "verbosity")
-
-	users []UserConfig
 )
 
-func loadConfig(configPath string) error {
+func loadConfig(configPath string) ([]*UserConfig, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return err
+		return nil, err
 	}
-	users = cfg.Users
-	return nil
+	return cfg.Users, nil
 }
 
-func addUserFromCLI(user, pass, pubkeyPath string) error {
-	uc := UserConfig{Username: user, Password: pass}
+func addUserFromCLI(user, pass, pubkeyPath string) ([]*UserConfig, error) {
+	uc := &UserConfig{Username: user, Password: pass}
 	if pubkeyPath != "" {
 		keyData, err := os.ReadFile(pubkeyPath)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		uc.PublicKey = strings.TrimSpace(string(keyData))
 	}
-	users = append(users, uc)
-	return nil
+	return []*UserConfig{uc}, nil
 }
 
 func generateECDSAKey(path string) error {
@@ -158,28 +243,29 @@ func main() {
 		}
 	}
 
+	var users []*UserConfig
 	if *configPath != "" {
-		if err := loadConfig(*configPath); err != nil {
+		u, err := loadConfig(*configPath)
+		if err != nil {
 			Vf(0, "Failed to load config: %v", err)
 			os.Exit(1)
 		}
+		users = u
 		Vf(2, "Loaded users from config: %d", len(users))
 	} else if *cliUser != "" {
-		if err := addUserFromCLI(*cliUser, *cliPass, *cliPubKey); err != nil {
+		u, err := addUserFromCLI(*cliUser, *cliPass, *cliPubKey)
+		if err != nil {
 			Vf(0, "Failed to add user from CLI: %v", err)
 			os.Exit(1)
 		}
+		users = u
 		Vf(2, "Loaded user from CLI: %s", *cliUser)
 	} else {
 		Vf(0, "No user config provided. Use --config or --user")
 		os.Exit(1)
 	}
 
-	config := &ssh.ServerConfig{
-		PasswordCallback:  passwordAuth,
-		PublicKeyCallback: publicKeyAuth,
-		ServerVersion:     "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.13",
-	}
+	srv := NewSftpSrv(users, *rootDir)
 	privateKeys := strings.SplitSeq(*keyPath, ",")
 	for k := range privateKeys {
 		if _, err := os.Stat(k); err == nil {
@@ -193,7 +279,7 @@ func main() {
 				Vf(0, "Failed to parse private key %s: %v", k, err)
 				continue
 			}
-			config.AddHostKey(key)
+			srv.config.AddHostKey(key)
 		}
 	}
 
@@ -210,65 +296,8 @@ func main() {
 			Vf(1, "Failed to accept incoming connection: %v", err)
 			continue
 		}
-		go handleConn(conn, config, *rootDir)
+		go srv.HandleConn(conn, *rootDir)
 	}
-}
-
-func passwordAuth(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-	for _, u := range users {
-		if subtle.ConstantTimeCompare([]byte(c.User()), []byte(u.Username)) == 1 &&
-			u.Password != "" && subtle.ConstantTimeCompare(pass, []byte(u.Password)) == 1 {
-			return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
-		}
-	}
-	return nil, fmt.Errorf("password rejected for %q", c.User())
-}
-
-func publicKeyAuth(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
-	pubKeyData := base64.StdEncoding.EncodeToString(pubKey.Marshal())
-	for _, u := range users {
-		if u.Username == c.User() && u.PublicKey != "" {
-			// 支援 OpenSSH 格式與 base64 內容比對
-			if strings.Contains(u.PublicKey, pubKeyData) {
-				return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("public key rejected for %q", c.User())
-}
-
-func handleConn(conn net.Conn, config *ssh.ServerConfig, rootDir string) {
-	defer conn.Close()
-	sshConn, chans, reqs, err := ssh.NewServerConn(conn, config)
-	if err != nil {
-		Vf(1, "Failed to handshake: %v", err)
-		return
-	}
-	defer sshConn.Close()
-	go ssh.DiscardRequests(reqs)
-
-	Vln(3, "New SSH connection from", conn.RemoteAddr(), sshConn)
-
-	for newChannel := range chans {
-		switch newChannel.ChannelType() {
-		case "session":
-			channel, requests, err := newChannel.Accept()
-			if err != nil {
-				Vf(1, "Could not accept channel: %v", err)
-				continue
-			}
-			Vln(3, "New session channel", channel)
-			go handleSession(channel, requests, rootDir)
-		case "direct-tcpip":
-			go handleDirectTCPIP(newChannel)
-		case "forwarded-tcpip":
-			go handleForwardedTCPIP(newChannel)
-		default:
-			Vln(3, "New channel", newChannel.ChannelType(), newChannel.ExtraData())
-			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
-		}
-	}
-	Vln(3, "SSH connection end", conn.RemoteAddr(), sshConn)
 }
 
 // handleDirectTCPIP implements ssh -L/ssh -D (local/ dynamic port forward)

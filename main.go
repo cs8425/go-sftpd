@@ -17,6 +17,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/pkg/sftp"
@@ -104,7 +105,7 @@ func generateED25519Key(path string) error {
 }
 
 func generateRSAKey(path string) error {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	priv, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
 		return err
 	}
@@ -122,9 +123,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	var (
 		bindAddr   = flag.String("bind", ":2022", "Bind address")
-		keyPath    = flag.String("hostkey", "server.key", "Path to SSH host private key")
-		keyPathED  = flag.String("hostkey-ed25519", "server_ed25519.key", "Path to SSH ED25519 private key")
-		keyPathRSA = flag.String("hostkey-rsa", "server_rsa.key", "Path to SSH RSA private key")
+		keyPath    = flag.String("hostkey", "server_ed25519.key,server_ec.key,server_rsa.key", "Path to SSH host private key")
 		rootDir    = flag.String("root", ".", "Root directory for SFTP access")
 		configPath = flag.String("config", "", "Path to JSON config file")
 		cliUser    = flag.String("user", "", "Username (CLI mode)")
@@ -135,25 +134,26 @@ func main() {
 	flag.Parse()
 
 	if *genKey {
-		if _, err := os.Stat(*keyPath); os.IsNotExist(err) {
-			Vf(1, "Server key not found, generating ECDSA key: %s", *keyPath)
-			if err := generateECDSAKey(*keyPath); err != nil {
-				Vf(0, "Failed to generate ECDSA key: %v", err)
-				os.Exit(1)
-			}
-		}
-		if _, err := os.Stat(*keyPathED); os.IsNotExist(err) {
-			Vf(1, "ED25519 key not found, generating: %s", *keyPathED)
-			if err := generateED25519Key(*keyPathED); err != nil {
-				Vf(0, "Failed to generate ED25519 key: %v", err)
-				os.Exit(1)
-			}
-		}
-		if _, err := os.Stat(*keyPathRSA); os.IsNotExist(err) {
-			Vf(1, "RSA key not found, generating: %s", *keyPathRSA)
-			if err := generateRSAKey(*keyPathRSA); err != nil {
-				Vf(0, "Failed to generate RSA key: %v", err)
-				os.Exit(1)
+		fps := strings.SplitSeq(*keyPath, ",")
+		for fp := range fps {
+			if _, err := os.Stat(fp); os.IsNotExist(err) {
+				keyType, genFn := "ED25519", generateED25519Key
+				ext := filepath.Ext(fp)
+				nameNoExt := fp[:len(fp)-len(ext)]
+				switch {
+				case strings.HasSuffix(nameNoExt, "_rsa"):
+					keyType, genFn = "RSA", generateRSAKey
+				case strings.HasSuffix(nameNoExt, "_ecdsa"):
+					keyType, genFn = "P256", generateECDSAKey
+				case strings.HasSuffix(nameNoExt, "_ed25519"):
+					fallthrough
+				default:
+					keyType, genFn = "ED25519", generateED25519Key
+				}
+				Vf(1, "key not found, generating %v key: %s\n", keyType, fp)
+				if err := genFn(fp); err != nil {
+					Vln(0, "Failed to generate ED25519 key:", err)
+				}
 			}
 		}
 	}
@@ -175,13 +175,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	privateKeys := []string{*keyPathED, *keyPath, *keyPathRSA}
 	config := &ssh.ServerConfig{
 		PasswordCallback:  passwordAuth,
 		PublicKeyCallback: publicKeyAuth,
 		ServerVersion:     "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.13",
 	}
-	for _, k := range privateKeys {
+	privateKeys := strings.SplitSeq(*keyPath, ",")
+	for k := range privateKeys {
 		if _, err := os.Stat(k); err == nil {
 			keyBytes, err := os.ReadFile(k)
 			if err != nil {

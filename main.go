@@ -1,0 +1,371 @@
+package main
+
+import (
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/subtle"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"strings"
+
+	"github.com/pkg/sftp"
+	"golang.org/x/crypto/ssh"
+)
+
+// UserConfig represents a user account
+type UserConfig struct {
+	Username  string `json:"username"`
+	Password  string `json:"password"`
+	PublicKey string `json:"public_key"`
+}
+
+// Config represents the config file structure
+type Config struct {
+	Users []UserConfig `json:"users"`
+}
+
+var (
+	verbosity = flag.Int("v", 3, "verbosity")
+
+	users []UserConfig
+)
+
+func loadConfig(configPath string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return err
+	}
+	users = cfg.Users
+	return nil
+}
+
+func addUserFromCLI(user, pass, pubkeyPath string) error {
+	uc := UserConfig{Username: user, Password: pass}
+	if pubkeyPath != "" {
+		keyData, err := os.ReadFile(pubkeyPath)
+		if err != nil {
+			return err
+		}
+		uc.PublicKey = strings.TrimSpace(string(keyData))
+	}
+	users = append(users, uc)
+	return nil
+}
+
+func generateECDSAKey(path string) error {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	der, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	keyBlock := pem.Block{Type: "EC PRIVATE KEY", Bytes: der}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return pem.Encode(f, &keyBlock)
+}
+
+func generateED25519Key(path string) error {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	keyBlock := pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return pem.Encode(f, &keyBlock)
+}
+
+func generateRSAKey(path string) error {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+	privBytes := x509.MarshalPKCS1PrivateKey(priv)
+	keyBlock := pem.Block{Type: "RSA PRIVATE KEY", Bytes: privBytes}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return pem.Encode(f, &keyBlock)
+}
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	var (
+		bindAddr   = flag.String("bind", ":2022", "Bind address")
+		keyPath    = flag.String("hostkey", "server.key", "Path to SSH host private key")
+		keyPathED  = flag.String("hostkey-ed25519", "server_ed25519.key", "Path to SSH ED25519 private key")
+		keyPathRSA = flag.String("hostkey-rsa", "server_rsa.key", "Path to SSH RSA private key")
+		rootDir    = flag.String("root", ".", "Root directory for SFTP access")
+		configPath = flag.String("config", "", "Path to JSON config file")
+		cliUser    = flag.String("user", "", "Username (CLI mode)")
+		cliPass    = flag.String("password", "", "Password (CLI mode)")
+		cliPubKey  = flag.String("pubkey", "", "Path to public key file (CLI mode)")
+		genKey     = flag.Bool("genkey", false, "Auto-generate ECDSA server key if not exist")
+	)
+	flag.Parse()
+
+	if *genKey {
+		if _, err := os.Stat(*keyPath); os.IsNotExist(err) {
+			Vf(1, "Server key not found, generating ECDSA key: %s", *keyPath)
+			if err := generateECDSAKey(*keyPath); err != nil {
+				Vf(0, "Failed to generate ECDSA key: %v", err)
+				os.Exit(1)
+			}
+		}
+		if _, err := os.Stat(*keyPathED); os.IsNotExist(err) {
+			Vf(1, "ED25519 key not found, generating: %s", *keyPathED)
+			if err := generateED25519Key(*keyPathED); err != nil {
+				Vf(0, "Failed to generate ED25519 key: %v", err)
+				os.Exit(1)
+			}
+		}
+		if _, err := os.Stat(*keyPathRSA); os.IsNotExist(err) {
+			Vf(1, "RSA key not found, generating: %s", *keyPathRSA)
+			if err := generateRSAKey(*keyPathRSA); err != nil {
+				Vf(0, "Failed to generate RSA key: %v", err)
+				os.Exit(1)
+			}
+		}
+	}
+
+	if *configPath != "" {
+		if err := loadConfig(*configPath); err != nil {
+			Vf(0, "Failed to load config: %v", err)
+			os.Exit(1)
+		}
+		Vf(2, "Loaded users from config: %d", len(users))
+	} else if *cliUser != "" {
+		if err := addUserFromCLI(*cliUser, *cliPass, *cliPubKey); err != nil {
+			Vf(0, "Failed to add user from CLI: %v", err)
+			os.Exit(1)
+		}
+		Vf(2, "Loaded user from CLI: %s", *cliUser)
+	} else {
+		Vf(0, "No user config provided. Use --config or --user")
+		os.Exit(1)
+	}
+
+	privateKeys := []string{*keyPathED, *keyPath, *keyPathRSA}
+	config := &ssh.ServerConfig{
+		PasswordCallback:  passwordAuth,
+		PublicKeyCallback: publicKeyAuth,
+		ServerVersion:     "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.13",
+	}
+	for _, k := range privateKeys {
+		if _, err := os.Stat(k); err == nil {
+			keyBytes, err := os.ReadFile(k)
+			if err != nil {
+				Vf(0, "Failed to load private key %s: %v", k, err)
+				continue
+			}
+			key, err := ssh.ParsePrivateKey(keyBytes)
+			if err != nil {
+				Vf(0, "Failed to parse private key %s: %v", k, err)
+				continue
+			}
+			config.AddHostKey(key)
+		}
+	}
+
+	listener, err := net.Listen("tcp", *bindAddr)
+	if err != nil {
+		Vf(0, "Failed to listen on %s: %v", *bindAddr, err)
+		os.Exit(1)
+	}
+	Vf(1, "Listening on %s", *bindAddr)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			Vf(1, "Failed to accept incoming connection: %v", err)
+			continue
+		}
+		go handleConn(conn, config, *rootDir)
+	}
+}
+
+func passwordAuth(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+	for _, u := range users {
+		if subtle.ConstantTimeCompare([]byte(c.User()), []byte(u.Username)) == 1 &&
+			u.Password != "" && subtle.ConstantTimeCompare(pass, []byte(u.Password)) == 1 {
+			return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
+		}
+	}
+	return nil, fmt.Errorf("password rejected for %q", c.User())
+}
+
+func publicKeyAuth(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+	pubKeyData := base64.StdEncoding.EncodeToString(pubKey.Marshal())
+	for _, u := range users {
+		if u.Username == c.User() && u.PublicKey != "" {
+			// 支援 OpenSSH 格式與 base64 內容比對
+			if strings.Contains(u.PublicKey, pubKeyData) {
+				return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("public key rejected for %q", c.User())
+}
+
+func handleConn(conn net.Conn, config *ssh.ServerConfig, rootDir string) {
+	defer conn.Close()
+	sshConn, chans, reqs, err := ssh.NewServerConn(conn, config)
+	if err != nil {
+		Vf(1, "Failed to handshake: %v", err)
+		return
+	}
+	defer sshConn.Close()
+	go ssh.DiscardRequests(reqs)
+
+	Vln(3, "New SSH connection from", conn.RemoteAddr(), sshConn)
+
+	for newChannel := range chans {
+		switch newChannel.ChannelType() {
+		case "session":
+			channel, requests, err := newChannel.Accept()
+			if err != nil {
+				Vf(1, "Could not accept channel: %v", err)
+				continue
+			}
+			Vln(3, "New session channel", channel)
+			go handleSession(channel, requests, rootDir)
+		case "direct-tcpip":
+			go handleDirectTCPIP(newChannel)
+		case "forwarded-tcpip":
+			go handleForwardedTCPIP(newChannel)
+		default:
+			Vln(3, "New channel", newChannel.ChannelType(), newChannel.ExtraData())
+			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+		}
+	}
+	Vln(3, "SSH connection end", conn.RemoteAddr(), sshConn)
+}
+
+// handleDirectTCPIP implements ssh -L/ssh -D (local/ dynamic port forward)
+func handleDirectTCPIP(newChannel ssh.NewChannel) {
+	var d struct {
+		DestAddr string
+		DestPort uint32
+		SrcAddr  string
+		SrcPort  uint32
+	}
+	ssh.Unmarshal(newChannel.ExtraData(), &d)
+	Vf(2, "direct-tcpip: %s:%d <- %s:%d", d.DestAddr, d.DestPort, d.SrcAddr, d.SrcPort)
+	remote, err := net.Dial("tcp", fmt.Sprintf("%s:%d", d.DestAddr, d.DestPort))
+	if err != nil {
+		newChannel.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+	ch, reqs, err := newChannel.Accept()
+	if err != nil {
+		remote.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	go proxyCopy(ch, remote)
+	go proxyCopy(remote, ch)
+}
+
+// handleForwardedTCPIP implements ssh -R (remote port forward)
+func handleForwardedTCPIP(newChannel ssh.NewChannel) {
+	var d struct {
+		DestAddr string
+		DestPort uint32
+		SrcAddr  string
+		SrcPort  uint32
+	}
+	ssh.Unmarshal(newChannel.ExtraData(), &d)
+	Vf(2, "forwarded-tcpip: %s:%d -> %s:%d", d.SrcAddr, d.SrcPort, d.DestAddr, d.DestPort)
+	local, err := net.Dial("tcp", fmt.Sprintf("%s:%d", d.DestAddr, d.DestPort))
+	if err != nil {
+		newChannel.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+	ch, reqs, err := newChannel.Accept()
+	if err != nil {
+		local.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	go proxyCopy(ch, local)
+	go proxyCopy(local, ch)
+}
+
+// proxyCopy copies data between two ReadWriteClosers
+func proxyCopy(dst io.WriteCloser, src io.ReadCloser) {
+	defer dst.Close()
+	defer src.Close()
+	io.Copy(dst, src)
+}
+
+func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, rootDir string) {
+	defer channel.Close()
+	for req := range requests {
+		Vln(3, "Received request:", req.Type, req.WantReply, req.Payload)
+		if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
+			req.Reply(true, nil)
+			sftpServer, err := sftp.NewServer(channel, sftp.WithServerWorkingDirectory(rootDir))
+			if err != nil {
+				Vf(1, "Failed to start SFTP subsystem: %v", err)
+				return
+			}
+			if err := sftpServer.Serve(); err != nil && err != io.EOF {
+				Vf(1, "SFTP server completed with error: %v", err)
+			}
+			Vln(1, "SFTP server completed")
+			return
+		}
+		req.Reply(false, nil)
+	}
+}
+
+func Vf(level int, format string, v ...interface{}) {
+	if level <= *verbosity {
+		log.Printf(format, v...)
+	}
+}
+func V(level int, v ...interface{}) {
+	if level <= *verbosity {
+		log.Print(v...)
+	}
+}
+func Vln(level int, v ...interface{}) {
+	if level <= *verbosity {
+		log.Println(v...)
+	}
+}
+func VRun(level int, fn func()) {
+	if level <= *verbosity {
+		fn()
+	}
+}

@@ -1,0 +1,10 @@
+# saved data
+/data/
+
+# exec
+go-sftpd
+go-sftpd.bin
+go-sftpd.exe
+
+# key
+*.key

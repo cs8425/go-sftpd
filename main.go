@@ -32,6 +32,24 @@ type UserConfig struct {
 	HomeDir   string `json:"home,omitempty"`
 }
 
+// TODO: multiple line for multiple public keys
+func (u *UserConfig) CheckPublicKey(pubKeyType string, pubKey string) bool {
+	if u.PublicKey == "" {
+		return false
+	}
+	if !strings.HasPrefix(u.PublicKey, pubKeyType) {
+		return false
+	}
+	parts := strings.Fields(u.PublicKey)
+	if len(parts) < 2 {
+		return false
+	}
+	if parts[1] == pubKey {
+		return true
+	}
+	return false
+}
+
 // Config represents the config file structure
 type Config struct {
 	Users []*UserConfig `json:"users"`
@@ -66,10 +84,16 @@ func (srv *SftpSrv) GetUser(name string) *UserConfig {
 }
 
 func (srv *SftpSrv) PasswordAuth(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+	user := c.User()
 	for _, u := range srv.Users {
-		if subtle.ConstantTimeCompare([]byte(c.User()), []byte(u.Username)) == 1 &&
-			u.Password != "" && subtle.ConstantTimeCompare(pass, []byte(u.Password)) == 1 {
-			Vln(3, "Accept passwordAuth", string(c.ClientVersion()), c.RemoteAddr(), c.User(), c)
+		if u.Password == "" {
+			continue
+		}
+		if u.Username != user {
+			continue
+		}
+		if subtle.ConstantTimeCompare(pass, []byte(u.Password)) == 1 {
+			Vln(3, "Accept PasswordAuth", string(c.ClientVersion()), c.RemoteAddr(), user)
 			return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
 		}
 	}
@@ -77,13 +101,16 @@ func (srv *SftpSrv) PasswordAuth(c ssh.ConnMetadata, pass []byte) (*ssh.Permissi
 }
 
 func (srv *SftpSrv) PublicKeyAuth(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+	user := c.User()
+	pubKeyType := pubKey.Type()
 	pubKeyData := base64.StdEncoding.EncodeToString(pubKey.Marshal())
 	for _, u := range srv.Users {
-		if u.Username == c.User() && u.PublicKey != "" {
-			// 支援 OpenSSH 格式與 base64 內容比對
-			if strings.Contains(u.PublicKey, pubKeyData) {
-				return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
-			}
+		if u.Username != user {
+			continue
+		}
+		if u.CheckPublicKey(pubKeyType, pubKeyData) {
+			Vln(3, "Accept PublicKeyAuth", string(c.ClientVersion()), c.RemoteAddr(), user, pubKeyType, pubKeyData)
+			return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
 		}
 	}
 	return nil, fmt.Errorf("public key rejected for %q", c.User())
@@ -261,7 +288,7 @@ func main() {
 		users = u
 		Vf(2, "Loaded user from CLI: %s", *cliUser)
 	} else {
-		Vf(0, "No user config provided. Use --config or --user")
+		Vf(0, "No user config provided. Use -config or -user")
 		os.Exit(1)
 	}
 

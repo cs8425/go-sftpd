@@ -30,6 +30,7 @@ type UserConfig struct {
 	Password  string `json:"pwd,omitempty"`
 	PublicKey string `json:"public_key,omitempty"`
 	HomeDir   string `json:"home,omitempty"`
+	Disable   bool   `json:"disable,omitempty"`
 }
 
 // TODO: multiple line for multiple public keys
@@ -56,9 +57,11 @@ type Config struct {
 }
 
 type SftpSrv struct {
-	config  *ssh.ServerConfig
-	rootDir string
-	Users   []*UserConfig
+	config                  *ssh.ServerConfig
+	rootDir                 string
+	enablePortForward       bool
+	enableRemotePortForward bool
+	Users                   []*UserConfig
 }
 
 func NewSftpSrv(users []*UserConfig, rootDir string) *SftpSrv {
@@ -86,6 +89,9 @@ func (srv *SftpSrv) GetUser(name string) *UserConfig {
 func (srv *SftpSrv) PasswordAuth(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 	user := c.User()
 	for _, u := range srv.Users {
+		if u.Disable {
+			continue
+		}
 		if u.Password == "" {
 			continue
 		}
@@ -93,7 +99,7 @@ func (srv *SftpSrv) PasswordAuth(c ssh.ConnMetadata, pass []byte) (*ssh.Permissi
 			continue
 		}
 		if subtle.ConstantTimeCompare(pass, []byte(u.Password)) == 1 {
-			Vln(3, "Accept PasswordAuth", string(c.ClientVersion()), c.RemoteAddr(), user)
+			Vln(3, "[auth]Accept PasswordAuth", string(c.ClientVersion()), c.RemoteAddr(), user)
 			return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
 		}
 	}
@@ -105,11 +111,14 @@ func (srv *SftpSrv) PublicKeyAuth(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ss
 	pubKeyType := pubKey.Type()
 	pubKeyData := base64.StdEncoding.EncodeToString(pubKey.Marshal())
 	for _, u := range srv.Users {
+		if u.Disable {
+			continue
+		}
 		if u.Username != user {
 			continue
 		}
 		if u.CheckPublicKey(pubKeyType, pubKeyData) {
-			Vln(3, "Accept PublicKeyAuth", string(c.ClientVersion()), c.RemoteAddr(), user, pubKeyType, pubKeyData)
+			Vln(3, "[auth]Accept PublicKeyAuth", string(c.ClientVersion()), c.RemoteAddr(), user, pubKeyType, pubKeyData)
 			return &ssh.Permissions{Extensions: map[string]string{"user": u.Username}}, nil
 		}
 	}
@@ -120,7 +129,7 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 	defer conn.Close()
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, srv.config)
 	if err != nil {
-		Vf(1, "Failed to handshake: %v", err)
+		Vf(1, "[conn][err]Failed to handshake: %v", err)
 		return
 	}
 	defer sshConn.Close()
@@ -128,7 +137,7 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 
 	user := srv.GetUser(sshConn.User())
 	userRootDir := filepath.Join(rootDir, user.HomeDir)
-	Vln(3, "New SSH connection from", conn.RemoteAddr(), user, userRootDir)
+	Vln(3, "[conn]New SSH connection from", conn.RemoteAddr(), user, userRootDir)
 
 	for newChannel := range chans {
 		switch newChannel.ChannelType() {
@@ -141,15 +150,24 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 			Vln(3, "New session channel", channel)
 			go handleSession(channel, requests, userRootDir)
 		case "direct-tcpip":
-			go handleDirectTCPIP(newChannel)
+			if srv.enablePortForward {
+				go handleDirectTCPIP(newChannel)
+			} else {
+				newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+			}
+		// TODO: fix this, this is the type send to ssh client
 		case "forwarded-tcpip":
-			go handleForwardedTCPIP(newChannel)
+			if srv.enableRemotePortForward {
+				go handleForwardedTCPIP(newChannel)
+			} else {
+				newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+			}
 		default:
 			Vln(3, "New channel", newChannel.ChannelType(), newChannel.ExtraData())
 			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 		}
 	}
-	Vln(3, "SSH connection end", conn.RemoteAddr(), sshConn)
+	Vln(3, "[conn]SSH connection end", conn.RemoteAddr(), sshConn)
 }
 
 var (
@@ -235,13 +253,16 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	var (
 		bindAddr   = flag.String("bind", ":2022", "Bind address")
-		keyPath    = flag.String("hostkey", "server_ed25519.key,server_ec.key,server_rsa.key", "Path to SSH host private key")
+		keyPath    = flag.String("hostkey", "server_ed25519.key,server_ecdsa.key,server_rsa.key", "Path to SSH host private key")
 		rootDir    = flag.String("root", ".", "Root directory for SFTP access")
 		configPath = flag.String("config", "", "Path to JSON config file")
 		cliUser    = flag.String("user", "", "Username (CLI mode)")
 		cliPass    = flag.String("password", "", "Password (CLI mode)")
 		cliPubKey  = flag.String("pubkey", "", "Path to public key file (CLI mode)")
 		genKey     = flag.Bool("genkey", false, "Auto-generate ECDSA server key if not exist")
+
+		portForward       = flag.Bool("port-forward", false, "enable local/ dynamic port forward feature (ssh -L/ssh -D)")
+		remoteRortForward = flag.Bool("remote-port-forward", false, "enable remote port forward feature (ssh -R)")
 	)
 	flag.Parse()
 
@@ -262,9 +283,9 @@ func main() {
 				default:
 					keyType, genFn = "ED25519", generateED25519Key
 				}
-				Vf(1, "key not found, generating %v key: %s\n", keyType, fp)
+				Vf(1, "[gnekey]key not found, generating %v key: %s\n", keyType, fp)
 				if err := genFn(fp); err != nil {
-					Vln(0, "Failed to generate ED25519 key:", err)
+					Vln(0, "[gnekey][err]Failed to generate key:", fp, keyType, err)
 				}
 			}
 		}
@@ -278,49 +299,54 @@ func main() {
 			os.Exit(1)
 		}
 		users = u
-		Vf(2, "Loaded users from config: %d", len(users))
+		Vf(2, "[config]Loaded users from config: %d", len(users))
 	} else if *cliUser != "" {
 		u, err := addUserFromCLI(*cliUser, *cliPass, *cliPubKey)
 		if err != nil {
-			Vf(0, "Failed to add user from CLI: %v", err)
+			Vf(0, "[config][err]Failed to add user from CLI: %v", err)
 			os.Exit(1)
 		}
 		users = u
-		Vf(2, "Loaded user from CLI: %s", *cliUser)
+		Vf(2, "[config]Loaded user from CLI: %s", *cliUser)
 	} else {
-		Vf(0, "No user config provided. Use -config or -user")
+		Vf(0, "[config][err]No user config provided. Use -config or -user")
 		os.Exit(1)
 	}
 
 	srv := NewSftpSrv(users, *rootDir)
+	srv.enablePortForward = *portForward
+	srv.enableRemotePortForward = *remoteRortForward
 	privateKeys := strings.SplitSeq(*keyPath, ",")
 	for k := range privateKeys {
 		if _, err := os.Stat(k); err == nil {
 			keyBytes, err := os.ReadFile(k)
 			if err != nil {
-				Vf(0, "Failed to load private key %s: %v", k, err)
+				Vf(0, "[key][err]Failed to load private key %s: %v", k, err)
 				continue
 			}
 			key, err := ssh.ParsePrivateKey(keyBytes)
 			if err != nil {
-				Vf(0, "Failed to parse private key %s: %v", k, err)
+				Vf(0, "[key][err]Failed to parse private key %s: %v", k, err)
 				continue
 			}
 			srv.config.AddHostKey(key)
+
+			pubkey := key.PublicKey()
+			Vln(0, "[key][fingerprint]", k, pubkey.Type(), ssh.FingerprintSHA256(pubkey), ssh.FingerprintLegacyMD5(pubkey))
 		}
 	}
 
 	listener, err := net.Listen("tcp", *bindAddr)
 	if err != nil {
-		Vf(0, "Failed to listen on %s: %v", *bindAddr, err)
+		Vf(0, "[sftpd][err]Failed to listen on %s: %v", *bindAddr, err)
 		os.Exit(1)
 	}
-	Vf(1, "Listening on %s", *bindAddr)
+	Vln(1, "[sftpd]Listening on", *bindAddr)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			Vf(1, "Failed to accept incoming connection: %v", err)
+			Vf(1, "[accept][err]Failed to accept incoming connection: %v", err)
 			continue
 		}
 		go srv.HandleConn(conn, *rootDir)
@@ -336,8 +362,8 @@ func handleDirectTCPIP(newChannel ssh.NewChannel) {
 		SrcPort  uint32
 	}
 	ssh.Unmarshal(newChannel.ExtraData(), &d)
-	Vf(2, "direct-tcpip: %s:%d <- %s:%d", d.DestAddr, d.DestPort, d.SrcAddr, d.SrcPort)
-	remote, err := net.Dial("tcp", fmt.Sprintf("%s:%d", d.DestAddr, d.DestPort))
+	Vf(2, "[channel]direct-tcpip: %s:%d -> %s:%d", d.SrcAddr, d.SrcPort, d.DestAddr, d.DestPort)
+	remote, err := net.Dial("tcp", net.JoinHostPort(d.DestAddr, fmt.Sprintf("%d", d.DestPort)))
 	if err != nil {
 		newChannel.Reject(ssh.ConnectionFailed, err.Error())
 		return
@@ -353,6 +379,7 @@ func handleDirectTCPIP(newChannel ssh.NewChannel) {
 }
 
 // handleForwardedTCPIP implements ssh -R (remote port forward)
+// TODO: fix this
 func handleForwardedTCPIP(newChannel ssh.NewChannel) {
 	var d struct {
 		DestAddr string
@@ -387,18 +414,18 @@ func proxyCopy(dst io.WriteCloser, src io.ReadCloser) {
 func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, rootDir string) {
 	defer channel.Close()
 	for req := range requests {
-		Vln(3, "Received request:", req.Type, req.WantReply, req.Payload)
+		Vln(3, "[session]Received request:", req.Type, req.WantReply, req.Payload)
 		if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
 			req.Reply(true, nil)
 			sftpServer, err := sftp.NewServer(channel, sftp.WithServerWorkingDirectory(rootDir))
 			if err != nil {
-				Vf(1, "Failed to start SFTP subsystem: %v", err)
+				Vf(1, "[session]Failed to start SFTP subsystem: %v", err)
 				return
 			}
 			if err := sftpServer.Serve(); err != nil && err != io.EOF {
-				Vf(1, "SFTP server completed with error: %v", err)
+				Vf(1, "[session]SFTP server completed with error: %v", err)
 			}
-			Vln(1, "SFTP server completed")
+			Vln(3, "[session]SFTP server completed")
 			return
 		}
 		req.Reply(false, nil)

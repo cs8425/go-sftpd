@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/pkg/sftp"
@@ -31,6 +32,10 @@ type UserConfig struct {
 	PublicKey string `json:"public_key,omitempty"`
 	HomeDir   string `json:"home,omitempty"`
 	Disable   bool   `json:"disable,omitempty"`
+}
+
+func (u *UserConfig) String() string {
+	return fmt.Sprintf("{user=%v root=%v key=%v hasPwd=%v disable=%v}", u.Username, u.HomeDir, u.PublicKey, u.Password != "", u.Disable)
 }
 
 // TODO: multiple line for multiple public keys
@@ -133,7 +138,7 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 		return
 	}
 	defer sshConn.Close()
-	go ssh.DiscardRequests(reqs)
+	go srv.handleRequests(sshConn, reqs)
 
 	user := srv.GetUser(sshConn.User())
 	userRootDir := filepath.Join(rootDir, user.HomeDir)
@@ -155,19 +160,52 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 			} else {
 				newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 			}
-		// TODO: fix this, this is the type send to ssh client
-		case "forwarded-tcpip":
-			if srv.enableRemotePortForward {
-				go handleForwardedTCPIP(newChannel)
-			} else {
-				newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
-			}
 		default:
 			Vln(3, "New channel", newChannel.ChannelType(), newChannel.ExtraData())
 			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 		}
 	}
 	Vln(3, "[conn]SSH connection end", conn.RemoteAddr(), sshConn)
+}
+
+func (srv *SftpSrv) handleRequests(sshConn *ssh.ServerConn, reqs <-chan *ssh.Request) {
+	for req := range reqs {
+		switch req.Type {
+		case "tcpip-forward":
+			go srv.handleForwardedTCPIP(sshConn, req)
+			continue
+		case "cancel-tcpip-forward":
+			fallthrough // TODO:
+		default:
+		}
+		if req.WantReply {
+			req.Reply(false, nil)
+		}
+	}
+}
+
+// handleForwardedTCPIP implements ssh -R (remote port forward)
+func (srv *SftpSrv) handleForwardedTCPIP(sshConn *ssh.ServerConn, req *ssh.Request) {
+	var d struct {
+		BindAddr string
+		BindPort uint32
+	}
+	ssh.Unmarshal(req.Payload, &d)
+	Vf(2, "[channel]tcpip-forward: %s:%d", d.BindAddr, d.BindPort)
+	ln, err := net.Listen("tcp", net.JoinHostPort(d.BindAddr, fmt.Sprintf("%d", d.BindPort)))
+	if err != nil {
+		req.Reply(false, []byte(err.Error()))
+		return
+	}
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	n, _ := strconv.ParseUint(portStr, 10, 32)
+	req.Reply(true, ssh.Marshal(struct {
+		BindPort uint32
+	}{
+		BindPort: uint32(n),
+	}))
+	// TODO: accept from ln and open channel
+	// sshConn.OpenChannel("forwarded-tcpip", ...)
 }
 
 var (
@@ -261,7 +299,7 @@ func main() {
 		cliPubKey  = flag.String("pubkey", "", "Path to public key file (CLI mode)")
 		genKey     = flag.Bool("genkey", false, "Auto-generate ECDSA server key if not exist")
 
-		portForward       = flag.Bool("port-forward", false, "enable local/ dynamic port forward feature (ssh -L/ssh -D)")
+		portForward       = flag.Bool("port-forward", false, "enable local/dynamic port forward feature (ssh -L/ssh -D)")
 		remoteRortForward = flag.Bool("remote-port-forward", false, "enable remote port forward feature (ssh -R)")
 	)
 	flag.Parse()
@@ -376,32 +414,6 @@ func handleDirectTCPIP(newChannel ssh.NewChannel) {
 	go ssh.DiscardRequests(reqs)
 	go proxyCopy(ch, remote)
 	go proxyCopy(remote, ch)
-}
-
-// handleForwardedTCPIP implements ssh -R (remote port forward)
-// TODO: fix this
-func handleForwardedTCPIP(newChannel ssh.NewChannel) {
-	var d struct {
-		DestAddr string
-		DestPort uint32
-		SrcAddr  string
-		SrcPort  uint32
-	}
-	ssh.Unmarshal(newChannel.ExtraData(), &d)
-	Vf(2, "forwarded-tcpip: %s:%d -> %s:%d", d.SrcAddr, d.SrcPort, d.DestAddr, d.DestPort)
-	local, err := net.Dial("tcp", fmt.Sprintf("%s:%d", d.DestAddr, d.DestPort))
-	if err != nil {
-		newChannel.Reject(ssh.ConnectionFailed, err.Error())
-		return
-	}
-	ch, reqs, err := newChannel.Accept()
-	if err != nil {
-		local.Close()
-		return
-	}
-	go ssh.DiscardRequests(reqs)
-	go proxyCopy(ch, local)
-	go proxyCopy(local, ch)
 }
 
 // proxyCopy copies data between two ReadWriteClosers

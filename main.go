@@ -423,19 +423,152 @@ func proxyCopy(dst io.WriteCloser, src io.ReadCloser) {
 	io.Copy(dst, src)
 }
 
+// RootedHandler implements sftp.FileReader, FileWriter, FileCmder, LstatFileLister(FileLister) for rootDir restriction
+type RootedHandler struct {
+	rootDir string
+}
+
+func (h *RootedHandler) cleanPath(fp string) string {
+	return filepath.Join(h.rootDir, filepath.Join("/", fp))
+}
+
+func (h *RootedHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	path := h.cleanPath(r.Filepath)
+	Vln(3, "[Fileread]", r.Method, r.Filepath, path)
+	return os.Open(path)
+}
+func (h *RootedHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	path := h.cleanPath(r.Filepath)
+	Vln(3, "[Filewrite]", r.Method, r.Filepath, path)
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+}
+func (h *RootedHandler) Filecmd(r *sftp.Request) error {
+	path := h.cleanPath(r.Filepath)
+	Vln(3, "[Filecmd]", r.Method, r.Filepath, path)
+	switch r.Method {
+	case "Setstat":
+		return h.setstat(r)
+	case "Rename":
+		newPath := h.cleanPath(r.Target)
+		return os.Rename(path, newPath)
+	case "Rmdir":
+		return os.Remove(path)
+	case "Remove":
+		return os.Remove(path)
+	case "Mkdir":
+		return os.Mkdir(path, 0755)
+	case "Symlink":
+		// os.Symlink(s.toLocalPath(p.Targetpath), s.toLocalPath(p.Linkpath))
+	case "Link":
+	// case "PosixRename":
+	// case "StatVFS":
+	default:
+	}
+	return sftp.ErrSSHFxOpUnsupported
+}
+
+func (h *RootedHandler) setstat(r *sftp.Request) error {
+	attr := r.Attributes()
+	if attr == nil {
+		return nil
+	}
+	flags := r.AttrFlags()
+	path := h.cleanPath(r.Filepath)
+	var err error
+	if flags.Permissions {
+		err = os.Chmod(path, attr.FileMode())
+	}
+	if err == nil && flags.UidGid {
+		err = os.Chown(path, int(attr.UID), int(attr.GID))
+	}
+	if err == nil && flags.Acmodtime {
+		err = os.Chtimes(path, attr.AccessTime(), attr.ModTime())
+	}
+	if err == nil && flags.Size {
+		err = os.Truncate(path, int64(attr.Size))
+	}
+	return err
+}
+
+var _ sftp.ReadlinkFileLister = (*RootedHandler)(nil)
+
+func (h *RootedHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	path := h.cleanPath(r.Filepath)
+	Vln(3, "[Filecmd]", r.Method, r.Filepath, path)
+	// "Readlink" handle by h.Readlink(fp string) (string, error)
+	switch r.Method {
+	case "List":
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		fis, err := f.Readdir(-1)
+		f.Close()
+		if err != nil {
+			return nil, err
+		}
+		return listerAt(fis), nil
+
+	case "Stat":
+		fis, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		return listerAt([]os.FileInfo{fis}), nil
+	case "Lstat": // should call h.Lstat(r *sftp.Request) (sftp.ListerAt, error)
+		return h.Lstat(r)
+	}
+	return nil, os.ErrInvalid
+}
+
+func (h *RootedHandler) Readlink(fp string) (string, error) {
+	path := h.cleanPath(fp)
+	dst, err := os.Readlink(path)
+	return dst, err
+}
+
+func (h *RootedHandler) Lstat(r *sftp.Request) (sftp.ListerAt, error) {
+	path := h.cleanPath(r.Filepath)
+	fis, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	return listerAt([]os.FileInfo{fis}), nil
+}
+
+type listerAt []os.FileInfo
+
+func (l listerAt) ListAt(ls []os.FileInfo, off int64) (int, error) {
+	if int(off) >= len(l) {
+		return 0, io.EOF
+	}
+	n := copy(ls, l[off:])
+	if n < len(ls) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func customSFTPHandlers(rootDir string) sftp.Handlers {
+	h := &RootedHandler{rootDir: rootDir}
+	return sftp.Handlers{
+		FileGet:  h,
+		FilePut:  h,
+		FileCmd:  h,
+		FileList: h,
+	}
+}
+
 func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, rootDir string) {
 	defer channel.Close()
 	for req := range requests {
 		Vln(3, "[session]Received request:", req.Type, req.WantReply, req.Payload)
 		if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
 			req.Reply(true, nil)
-			sftpServer, err := sftp.NewServer(channel, sftp.WithServerWorkingDirectory(rootDir))
-			if err != nil {
-				Vf(1, "[session]Failed to start SFTP subsystem: %v", err)
-				return
-			}
-			if err := sftpServer.Serve(); err != nil && err != io.EOF {
-				Vf(1, "[session]SFTP server completed with error: %v", err)
+			hs := customSFTPHandlers(rootDir)
+			rs := sftp.NewRequestServer(channel, hs, sftp.WithStartDirectory("/"))
+			if err := rs.Serve(); err != nil && err != io.EOF {
+				Vf(1, "[session]SFTP request server completed with error: %v", err)
 			}
 			Vln(3, "[session]SFTP server completed")
 			return

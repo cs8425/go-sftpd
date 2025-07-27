@@ -160,6 +160,8 @@ func main() {
 			Vf(0, "[config][err]Failed to add user from CLI: %v", err)
 			os.Exit(1)
 		}
+		u[0].EnablePortForward = *portForward
+		u[0].EnableRemotePortForward = *remoteRortForward
 		users = u
 		Vf(2, "[config]Loaded user from CLI: %s", *cliUser)
 	} else {

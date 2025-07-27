@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -48,6 +49,58 @@ func (u *UserConfig) CheckPublicKey(pubKeyType string, pubKey string) bool {
 	return false
 }
 
+// user session object
+type User struct {
+	Username string
+	RootDir  string
+
+	EnablePortForward       bool
+	EnableRemotePortForward bool
+
+	// RemotePortForward ref
+	mx            sync.Mutex
+	remoteForward map[string]net.Listener
+}
+
+func (u *User) String() string {
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	return fmt.Sprintf("{user=%v root=%v forward=%v remote-forward=%v ln=%v}", u.Username, u.RootDir, u.EnablePortForward, u.EnableRemotePortForward, len(u.remoteForward))
+}
+
+func (u *User) AddListener(ln net.Listener) {
+	addr := ln.Addr().String()
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	ln0, ok := u.remoteForward[addr]
+	if ok {
+		// ???
+		// ln0.Close()
+		_ = ln0
+		return
+	}
+	u.remoteForward[addr] = ln
+}
+
+func (u *User) CloseListener(addr string) {
+	u.mx.Lock()
+	ln0, ok := u.remoteForward[addr]
+	if ok {
+		ln0.Close()
+		delete(u.remoteForward, addr)
+	}
+	u.mx.Unlock()
+}
+
+func (u *User) Close() error {
+	u.mx.Lock()
+	for _, ln := range u.remoteForward {
+		ln.Close()
+	}
+	u.mx.Unlock()
+	return nil
+}
+
 type SftpSrv struct {
 	config                  *ssh.ServerConfig
 	rootDir                 string
@@ -69,10 +122,22 @@ func NewSftpSrv(users []*UserConfig, rootDir string) *SftpSrv {
 	return srv
 }
 
-func (srv *SftpSrv) GetUser(name string) *UserConfig {
+func (srv *SftpSrv) GetUser(name string) *User {
 	for _, u := range srv.Users {
 		if u.Username == name {
-			return u
+			userRootDir := filepath.Join(srv.rootDir, filepath.Clean("/"+u.HomeDir))
+			userSess := &User{
+				Username:                u.Username,
+				RootDir:                 userRootDir,
+				EnablePortForward:       u.EnablePortForward,
+				EnableRemotePortForward: u.EnableRemotePortForward,
+			}
+			if userSess.EnableRemotePortForward {
+				userSess.mx.Lock()
+				userSess.remoteForward = make(map[string]net.Listener)
+				userSess.mx.Unlock()
+			}
+			return userSess
 		}
 	}
 	return nil
@@ -125,11 +190,10 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 		return
 	}
 	defer sshConn.Close()
-	go srv.handleRequests(sshConn, reqs)
 
 	user := srv.GetUser(sshConn.User())
-	userRootDir := filepath.Join(rootDir, user.HomeDir)
-	Vln(3, "[conn]New SSH connection from", conn.RemoteAddr(), user, userRootDir)
+	Vln(3, "[conn]New SSH connection from", conn.RemoteAddr(), user)
+	go srv.handleRequests(sshConn, reqs, user)
 
 	for newChannel := range chans {
 		switch newChannel.ChannelType() {
@@ -140,7 +204,7 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 				continue
 			}
 			Vln(3, "New session channel", channel)
-			go handleSession(channel, requests, userRootDir, user.Username)
+			go handleSession(channel, requests, user)
 		case "direct-tcpip":
 			if srv.enablePortForward && user.EnablePortForward {
 				go handleDirectTCPIP(newChannel)
@@ -155,12 +219,12 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 	Vln(3, "[conn]SSH connection end", conn.RemoteAddr(), sshConn)
 }
 
-func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, rootDir string, username string) {
+func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, user *User) {
 	defer channel.Close()
 	for req := range requests {
 		Vln(3, "[session]Received request:", req.Type, req.WantReply, req.Payload)
 		if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
-			h, err := customSFTPHandlers(rootDir, username)
+			h, err := customSFTPHandlers(user.RootDir, user.Username)
 			if err != nil {
 				Vln(3, "[session]SFTP server init error", err)
 				req.Reply(false, nil)
@@ -183,44 +247,87 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, rootDir st
 	}
 }
 
-func (srv *SftpSrv) handleRequests(sshConn *ssh.ServerConn, reqs <-chan *ssh.Request) {
+func (srv *SftpSrv) handleRequests(sshConn *ssh.ServerConn, reqs <-chan *ssh.Request, user *User) {
 	for req := range reqs {
-		switch req.Type {
-		case "tcpip-forward":
-			go srv.handleForwardedTCPIP(sshConn, req)
-			continue
-		case "cancel-tcpip-forward":
-			fallthrough // TODO:
-		default:
+		if user.EnableRemotePortForward {
+			switch req.Type {
+			case "tcpip-forward":
+				go srv.handleForwardedTCPIP(sshConn, req, user)
+				continue
+			case "cancel-tcpip-forward":
+				// TODO:
+				// user.CloseListener()
+				continue
+			default:
+			}
 		}
 		if req.WantReply {
 			req.Reply(false, nil)
 		}
 	}
+	if user.EnableRemotePortForward {
+		user.Close()
+		Vf(2, "[requests]close all listener for client: %v", user)
+	}
 }
 
 // handleForwardedTCPIP implements ssh -R (remote port forward)
-func (srv *SftpSrv) handleForwardedTCPIP(sshConn *ssh.ServerConn, req *ssh.Request) {
+func (srv *SftpSrv) handleForwardedTCPIP(sshConn *ssh.ServerConn, req *ssh.Request, user *User) {
 	var d struct {
 		BindAddr string
 		BindPort uint32
 	}
 	ssh.Unmarshal(req.Payload, &d)
-	Vf(2, "[channel]tcpip-forward: %s:%d", d.BindAddr, d.BindPort)
+	Vf(2, "[requests]tcpip-forward: %s:%d", d.BindAddr, d.BindPort)
 	ln, err := net.Listen("tcp", net.JoinHostPort(d.BindAddr, fmt.Sprintf("%d", d.BindPort)))
 	if err != nil {
 		req.Reply(false, []byte(err.Error()))
 		return
 	}
+
+	// track for resource release
+	user.AddListener(ln)
+
 	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
-	n, _ := strconv.ParseUint(portStr, 10, 32)
+	bindPort, _ := strconv.ParseUint(portStr, 10, 32)
 	req.Reply(true, ssh.Marshal(struct {
 		BindPort uint32
 	}{
-		BindPort: uint32(n),
+		BindPort: uint32(bindPort),
 	}))
-	// TODO: accept from ln and open channel
-	// sshConn.OpenChannel("forwarded-tcpip", ...)
+
+	// accept from ln and open channel
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			break
+		}
+		go handleRemoteAccept(sshConn, conn, d.BindAddr, uint32(bindPort))
+	}
+}
+
+func handleRemoteAccept(sshConn *ssh.ServerConn, conn net.Conn, bindAddr string, bindPort uint32) {
+	originAddr, orignPortStr, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	originPort, _ := strconv.ParseUint(orignPortStr, 10, 32)
+	reqPayload := ssh.Marshal(struct {
+		DestAddr   string
+		DestPort   uint32
+		OriginAddr string
+		OriginPort uint32
+	}{
+		DestAddr:   bindAddr,
+		DestPort:   bindPort,
+		OriginAddr: originAddr,
+		OriginPort: uint32(originPort),
+	})
+	ch, reqs, err := sshConn.OpenChannel("forwarded-tcpip", reqPayload)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	go proxyCopy(ch, conn)
+	go proxyCopy(conn, ch)
 }
 
 // handleDirectTCPIP implements ssh -L/ssh -D (local/ dynamic port forward)

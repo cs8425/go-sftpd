@@ -21,14 +21,17 @@ import (
 
 // Config represents the config file structure
 type Config struct {
-	Users []*UserConfig `json:"users"`
+	Users                   []*UserConfig `json:"users"`
+	RootDir                 string        `json:"root,omitempty"`
+	EnablePortForward       bool          `json:"allow-port-forward,omitempty"`
+	EnableRemotePortForward bool          `json:"allow-remote-port-forward,omitempty"`
 }
 
 var (
 	verbosity = flag.Int("v", 3, "verbosity")
 )
 
-func loadConfig(configPath string) ([]*UserConfig, error) {
+func loadConfig(configPath string) (*Config, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, err
@@ -37,10 +40,10 @@ func loadConfig(configPath string) ([]*UserConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
-	return cfg.Users, nil
+	return &cfg, nil
 }
 
-func addUserFromCLI(user, pass, pubkeyPath string) ([]*UserConfig, error) {
+func addUserFromCLI(user, pass, pubkeyPath string) (*UserConfig, error) {
 	uc := &UserConfig{Username: user, Password: pass}
 	if pubkeyPath != "" {
 		keyData, err := os.ReadFile(pubkeyPath)
@@ -49,7 +52,7 @@ func addUserFromCLI(user, pass, pubkeyPath string) ([]*UserConfig, error) {
 		}
 		uc.PublicKey = strings.TrimSpace(string(keyData))
 	}
-	return []*UserConfig{uc}, nil
+	return uc, nil
 }
 
 func generateECDSAKey(path string) error {
@@ -104,21 +107,24 @@ func generateRSAKey(path string) error {
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	var (
 		bindAddr   = flag.String("bind", ":2022", "Bind address")
 		keyPath    = flag.String("hostkey", "server_ed25519.key,server_ecdsa.key,server_rsa.key", "Path to SSH host private key")
-		rootDir    = flag.String("root", ".", "Root directory for SFTP access")
 		configPath = flag.String("config", "", "Path to JSON config file")
 		cliUser    = flag.String("user", "", "Username (CLI mode)")
 		cliPass    = flag.String("password", "", "Password (CLI mode)")
 		cliPubKey  = flag.String("pubkey", "", "Path to public key file (CLI mode)")
+		rootDir    = flag.String("root", ".", "Root directory for SFTP access (CLI mode)")
 		genKey     = flag.Bool("genkey", false, "Auto-generate ECDSA server key if not exist")
 
 		portForward       = flag.Bool("port-forward", false, "enable local/dynamic port forward feature (ssh -L/ssh -D)")
 		remoteRortForward = flag.Bool("remote-port-forward", false, "enable remote port forward feature (ssh -R)")
 	)
 	flag.Parse()
+	if *verbosity >= 4 {
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	}
 
 	if *genKey {
 		fps := strings.SplitSeq(*keyPath, ",")
@@ -145,33 +151,40 @@ func main() {
 		}
 	}
 
-	var users []*UserConfig
+	var serverConfig *Config
 	if *configPath != "" {
-		u, err := loadConfig(*configPath)
+		config, err := loadConfig(*configPath)
 		if err != nil {
 			Vf(0, "Failed to load config: %v", err)
 			os.Exit(1)
 		}
-		users = u
-		Vf(2, "[config]Loaded users from config: %d", len(users))
+		// if config file not set, use CLI config
+		if config.RootDir == "" {
+			config.RootDir = *rootDir
+		}
+		serverConfig = config
+		Vf(2, "[config]Loaded users from config: %d", len(config.Users))
 	} else if *cliUser != "" {
 		u, err := addUserFromCLI(*cliUser, *cliPass, *cliPubKey)
 		if err != nil {
 			Vf(0, "[config][err]Failed to add user from CLI: %v", err)
 			os.Exit(1)
 		}
-		u[0].EnablePortForward = *portForward
-		u[0].EnableRemotePortForward = *remoteRortForward
-		users = u
+		u.EnablePortForward = *portForward
+		u.EnableRemotePortForward = *remoteRortForward
+		serverConfig = &Config{
+			Users:                   []*UserConfig{u},
+			RootDir:                 *rootDir,
+			EnablePortForward:       *portForward,
+			EnableRemotePortForward: *remoteRortForward,
+		}
 		Vf(2, "[config]Loaded user from CLI: %s", *cliUser)
 	} else {
 		Vf(0, "[config][err]No user config provided. Use -config or -user")
 		os.Exit(1)
 	}
 
-	srv := NewSftpSrv(users, *rootDir)
-	srv.enablePortForward = *portForward
-	srv.enableRemotePortForward = *remoteRortForward
+	srv := NewSftpSrv(serverConfig)
 	privateKeys := strings.SplitSeq(*keyPath, ",")
 	for k := range privateKeys {
 		if _, err := os.Stat(k); err == nil {
@@ -198,6 +211,9 @@ func main() {
 		os.Exit(1)
 	}
 	Vln(1, "[sftpd]Listening on", *bindAddr)
+	Vln(1, "[sftpd]RootDir", serverConfig.RootDir)
+	Vln(1, "[sftpd]PortForward enable", serverConfig.EnablePortForward)
+	Vln(1, "[sftpd]RemotePortForward enable", serverConfig.EnableRemotePortForward)
 
 	for {
 		conn, err := listener.Accept()

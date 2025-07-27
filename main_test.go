@@ -34,11 +34,11 @@ func TestAddUserFromCLI(t *testing.T) {
 	pubFile.Write([]byte("ssh-ed25519 " + string(pub)))
 	pubFile.Close()
 
-	users, err := addUserFromCLI("testuser", "testpass", pubFile.Name())
+	user, err := addUserFromCLI("testuser", "testpass", pubFile.Name())
 	if err != nil {
 		t.Fatalf("addUserFromCLI failed: %v", err)
 	}
-	if len(users) != 1 || users[0].Username != "testuser" {
+	if user.Username != "testuser" {
 		t.Fatalf("User not added correctly")
 	}
 }
@@ -53,11 +53,11 @@ func TestLoadConfig(t *testing.T) {
 	tmpfile.Write([]byte(jsonData))
 	tmpfile.Close()
 
-	users, err := loadConfig(tmpfile.Name())
+	config, err := loadConfig(tmpfile.Name())
 	if err != nil {
 		t.Fatalf("loadConfig failed: %v", err)
 	}
-	if len(users) != 1 || users[0].Username != "a" {
+	if len(config.Users) != 1 || config.Users[0].Username != "a" {
 		t.Fatalf("Config not loaded correctly")
 	}
 }

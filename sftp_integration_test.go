@@ -18,8 +18,21 @@ func startTestServer(t *testing.T, addr, keyPath, rootDir string) net.Listener {
 	go func() {
 		privateBytes, _ := os.ReadFile(keyPath)
 		private, _ := ssh.ParsePrivateKey(privateBytes)
-		users := []*UserConfig{{Username: "testuser", Password: "testpass", HomeDir: "", EnablePortForward: true, EnableRemotePortForward: true}}
-		srv := NewSftpSrv(users, rootDir)
+		users := []*UserConfig{{
+			Username:                "testuser",
+			Password:                "testpass",
+			HomeDir:                 "",
+			EnablePortForward:       true,
+			EnableRemotePortForward: true,
+		},
+		}
+		config := &Config{
+			Users:                   users,
+			RootDir:                 rootDir,
+			EnablePortForward:       true,
+			EnableRemotePortForward: true,
+		}
+		srv := NewSftpSrv(config)
 		srv.enablePortForward = true
 		srv.enableRemotePortForward = true
 		srv.config.AddHostKey(private)

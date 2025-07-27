@@ -109,10 +109,12 @@ type SftpSrv struct {
 	Users                   []*UserConfig
 }
 
-func NewSftpSrv(users []*UserConfig, rootDir string) *SftpSrv {
+func NewSftpSrv(config *Config) *SftpSrv {
 	srv := &SftpSrv{
-		Users:   users,
-		rootDir: rootDir,
+		Users:                   config.Users,
+		rootDir:                 config.RootDir,
+		enablePortForward:       config.EnablePortForward,
+		enableRemotePortForward: config.EnableRemotePortForward,
 	}
 	srv.config = &ssh.ServerConfig{
 		PasswordCallback:  srv.PasswordAuth,

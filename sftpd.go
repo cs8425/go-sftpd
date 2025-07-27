@@ -137,7 +137,7 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 				continue
 			}
 			Vln(3, "New session channel", channel)
-			go handleSession(channel, requests, userRootDir)
+			go handleSession(channel, requests, userRootDir, user.Username)
 		case "direct-tcpip":
 			if srv.enablePortForward {
 				go handleDirectTCPIP(newChannel)
@@ -152,12 +152,12 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 	Vln(3, "[conn]SSH connection end", conn.RemoteAddr(), sshConn)
 }
 
-func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, rootDir string) {
+func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, rootDir string, username string) {
 	defer channel.Close()
 	for req := range requests {
 		Vln(3, "[session]Received request:", req.Type, req.WantReply, req.Payload)
 		if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
-			h, err := customSFTPHandlers(rootDir)
+			h, err := customSFTPHandlers(rootDir, username)
 			if err != nil {
 				Vln(3, "[session]SFTP server init error", err)
 				req.Reply(false, nil)

@@ -14,8 +14,9 @@ import (
 // simulate as Unix file system exposed via sftp
 // the root "/" mapping to user's home directory and should NOT escape
 type RootedHandler struct {
-	root    *os.Root
-	rootDir string
+	root     *os.Root
+	rootDir  string
+	username string
 }
 
 // for os.Root API, file path should not in absolute
@@ -140,6 +141,18 @@ func (h *RootedHandler) setstat(r *sftp.Request, path string) error {
 	return err
 }
 
+// implement sftp.NameLookupFileLister
+var _ sftp.NameLookupFileLister = (*RootedHandler)(nil)
+
+// currently hard code as user name
+// TODO: more config?
+func (h *RootedHandler) LookupUserName(uid string) string {
+	return h.username
+}
+func (h *RootedHandler) LookupGroupName(gid string) string {
+	return h.username
+}
+
 var _ sftp.FileLister = (*RootedHandler)(nil)
 
 func (h *RootedHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
@@ -227,10 +240,10 @@ type FileInfo struct {
 
 // currently hard code, maybe need config?
 func (fi *FileInfo) Uid() uint32 {
-	return 10032
+	return 0
 }
 func (fi *FileInfo) Gid() uint32 {
-	return 10032
+	return 0
 }
 
 type listerAt []*FileInfo
@@ -267,14 +280,15 @@ func (l listerAt) Close() error {
 	return nil
 }
 
-func customSFTPHandlers(rootDir string) (*RootedHandler, error) {
+func customSFTPHandlers(rootDir string, username string) (*RootedHandler, error) {
 	root, err := os.OpenRoot(rootDir)
 	if err != nil {
 		return nil, err
 	}
 	h := &RootedHandler{
-		root:    root,
-		rootDir: rootDir,
+		root:     root,
+		rootDir:  rootDir,
+		username: username,
 	}
 	return h, nil
 }

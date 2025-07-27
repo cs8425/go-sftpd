@@ -21,6 +21,9 @@ type UserConfig struct {
 	PublicKey string `json:"public_key,omitempty"`
 	HomeDir   string `json:"home,omitempty"`
 	Disable   bool   `json:"disable,omitempty"`
+
+	EnablePortForward       bool `json:"allow-port-forward,omitempty"`
+	EnableRemotePortForward bool `json:"allow-remote-port-forward,omitempty"`
 }
 
 func (u *UserConfig) String() string {
@@ -139,7 +142,7 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 			Vln(3, "New session channel", channel)
 			go handleSession(channel, requests, userRootDir, user.Username)
 		case "direct-tcpip":
-			if srv.enablePortForward {
+			if srv.enablePortForward && user.EnablePortForward {
 				go handleDirectTCPIP(newChannel)
 			} else {
 				newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")

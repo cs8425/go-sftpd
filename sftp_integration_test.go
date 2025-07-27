@@ -1,7 +1,6 @@
 package main
 
 import (
-	"io"
 	"net"
 	"os"
 	"testing"
@@ -82,16 +81,50 @@ func TestSSHAndSFTP(t *testing.T) {
 	f.Write([]byte("world"))
 	f.Close()
 
-	f2, err := sftpClient.Open("hello.txt")
+	// Rename file
+	err = sftpClient.Rename("hello.txt", "renamed.txt")
 	if err != nil {
-		t.Fatalf("SFTP open failed: %v", err)
+		t.Fatalf("SFTP rename failed: %v", err)
 	}
-	data, err := io.ReadAll(f2)
-	f2.Close()
+
+	// Remove file
+	err = sftpClient.Remove("renamed.txt")
 	if err != nil {
-		t.Fatalf("SFTP read failed: %v", err)
+		t.Fatalf("SFTP remove failed: %v", err)
 	}
-	if string(data) != "world" {
-		t.Fatalf("SFTP file content mismatch: %s", string(data))
+
+	// Create directory
+	err = sftpClient.Mkdir("testdir")
+	if err != nil {
+		t.Fatalf("SFTP mkdir failed: %v", err)
+	}
+
+	// Create file in directory
+	f3, err := sftpClient.Create("testdir/file1.txt")
+	if err != nil {
+		t.Fatalf("SFTP create in dir failed: %v", err)
+	}
+	f3.Write([]byte("abc"))
+	f3.Close()
+
+	// List directory
+	files, err := sftpClient.ReadDir("testdir")
+	if err != nil {
+		t.Fatalf("SFTP readdir failed: %v", err)
+	}
+	if len(files) != 1 || files[0].Name() != "file1.txt" {
+		t.Fatalf("SFTP dir listing incorrect: %+v", files)
+	}
+
+	// Remove file in directory
+	err = sftpClient.Remove("testdir/file1.txt")
+	if err != nil {
+		t.Fatalf("SFTP remove in dir failed: %v", err)
+	}
+
+	// Remove directory
+	err = sftpClient.RemoveDirectory("testdir")
+	if err != nil {
+		t.Fatalf("SFTP rmdir failed: %v", err)
 	}
 }

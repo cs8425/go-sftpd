@@ -264,8 +264,10 @@ func (l listerAt) ListAt(ls []os.FileInfo, off int64) (int, error) {
 	}
 	// n := copy(ls, l[off:])
 	n := 0
-	for i, fi := range l[off:] {
-		ls[i] = fi
+	l0 := l[off:]
+	sz := min(len(ls), len(l0))
+	for i := range sz {
+		ls[i] = l0[i]
 		n += 1
 	}
 	if n < len(ls) {

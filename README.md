@@ -37,7 +37,10 @@ Create `config.json`:
       "public_key": "ssh-ed25519 AAAA...",
       "home": "userdir"
     }
-  ]
+  ],
+  "root": "./sftp-root/",
+  "allow-port-forward": true,
+  "allow-remote-port-forward": false
 }
 ```
 Run:

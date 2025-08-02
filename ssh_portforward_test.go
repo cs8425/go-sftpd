@@ -154,8 +154,53 @@ func TestSSHLPortForward(t *testing.T) {
 	}
 	socksConn.Close()
 
-	// TODO:
 	// ssh -R: remote port forward
+	// 在 client 端請求 remote forward (ssh -R)
+	remoteListener, err := client.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("remote forward listen failed: %v", err)
+	}
+	// defer remoteListener.Close()
+	Vln(0, "remote listen addr", remoteListener.Addr().String())
+
+	// 在 server 端連到 remoteListener，資料會被轉發到 client，再由 client 轉發到 echoAddr
+	go func() {
+		for {
+			conn, err := remoteListener.Accept()
+			Vln(0, "remote listen accept", conn, err, echoAddr)
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				// 由 client 端連到 echoAddr
+				remote, err := net.Dial("tcp", echoAddr)
+				Vln(0, "remote listen Dial to echo", remote.RemoteAddr(), remote.LocalAddr(), err, echoAddr)
+				if err != nil {
+					return
+				}
+				defer remote.Close()
+				go io.Copy(remote, conn)
+				io.Copy(conn, remote)
+			}(conn)
+		}
+	}()
+
+	// 在 server 端連到 remoteListener 的地址，驗證資料來回
+	serverSideConn, err := net.Dial("tcp", remoteListener.Addr().String())
+	if err != nil {
+		t.Fatalf("server side dial to remoteListener failed: %v", err)
+	}
+	Vln(0, "server-side dial", serverSideConn.RemoteAddr(), serverSideConn.LocalAddr())
+	msgR := []byte("helloR")
+	serverSideConn.Write(msgR)
+	bufR := make([]byte, len(msgR))
+	io.ReadFull(serverSideConn, bufR)
+	if string(bufR) != string(msgR) {
+		t.Fatalf("remote forward echo mismatch: got %q", bufR)
+	}
+	serverSideConn.Close()
+	Vln(0, "test end")
 }
 
 func dialViaSocks5(targetAddr string, socksAddr string) (net.Conn, error) {

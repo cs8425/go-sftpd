@@ -225,25 +225,36 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, user *User
 	defer channel.Close()
 	for req := range requests {
 		Vln(3, "[session]Received request:", req.Type, req.WantReply, req.Payload)
-		if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
-			h, err := customSFTPHandlers(user.RootDir, user.Username)
-			if err != nil {
-				Vln(3, "[session]SFTP server init error", err)
-				req.Reply(false, nil)
+		switch req.Type {
+		case "subsystem":
+			if string(req.Payload[4:]) == "sftp" {
+				h, err := customSFTPHandlers(user.RootDir, user.Username)
+				if err != nil {
+					Vln(3, "[session]SFTP server init error", err)
+					req.Reply(false, nil)
+					continue
+				}
+				req.Reply(true, nil)
+				rs := sftp.NewRequestServer(channel, sftp.Handlers{
+					FileGet:  h,
+					FilePut:  h,
+					FileCmd:  h,
+					FileList: h,
+				}, sftp.WithStartDirectory("/"))
+				if err := rs.Serve(); err != nil && err != io.EOF {
+					Vf(1, "[session]SFTP request server completed with error: %v", err)
+				}
+				Vln(3, "[session]SFTP server completed")
+				return
+			}
+		case "shell":
+			go io.Copy(io.Discard, channel)
+			// We only accept the default shell (i.e. no command in the Payload)
+			if len(req.Payload) == 0 {
+				req.Reply(true, nil)
 				continue
 			}
-			req.Reply(true, nil)
-			rs := sftp.NewRequestServer(channel, sftp.Handlers{
-				FileGet:  h,
-				FilePut:  h,
-				FileCmd:  h,
-				FileList: h,
-			}, sftp.WithStartDirectory("/"))
-			if err := rs.Serve(); err != nil && err != io.EOF {
-				Vf(1, "[session]SFTP request server completed with error: %v", err)
-			}
-			Vln(3, "[session]SFTP server completed")
-			return
+		default:
 		}
 		req.Reply(false, nil)
 	}

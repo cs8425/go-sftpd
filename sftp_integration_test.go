@@ -10,10 +10,10 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-func startTestServer(t *testing.T, addr, keyPath, rootDir string) net.Listener {
+func startTestServer(addr, keyPath, rootDir string) (net.Listener, error) {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		t.Fatalf("Failed to listen: %v", err)
+		return nil, err
 	}
 	go func() {
 		privateBytes, _ := os.ReadFile(keyPath)
@@ -44,39 +44,17 @@ func startTestServer(t *testing.T, addr, keyPath, rootDir string) net.Listener {
 			go srv.HandleConn(conn, rootDir)
 		}
 	}()
-	return listener
+	return listener, nil
 }
 
 func TestSSHAndSFTP(t *testing.T) {
-	keyFile, err := os.CreateTemp("", "testkey_*.pem")
-	if err != nil {
-		t.Fatalf("TempFile error: %v", err)
-	}
-	defer os.Remove(keyFile.Name())
-	keyFile.Close()
-	if err := generateED25519Key(keyFile.Name()); err != nil {
-		t.Fatalf("generateED25519Key failed: %v", err)
-	}
-
-	tmpDir, err := os.MkdirTemp("", "sftproot_")
-	if err != nil {
-		t.Fatalf("TempDir error: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	listener := startTestServer(t, "127.0.0.1:0", keyFile.Name(), tmpDir)
-	defer listener.Close()
-	addr := listener.Addr().String()
-	// Give server a moment to start
-	time.Sleep(200 * time.Millisecond)
-
 	sshConfig := &ssh.ClientConfig{
 		User:            "testuser",
 		Auth:            []ssh.AuthMethod{ssh.Password("testpass")},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         2 * time.Second,
 	}
-	client, err := ssh.Dial("tcp", addr, sshConfig)
+	client, err := ssh.Dial("tcp", sftpServerAddr, sshConfig)
 	if err != nil {
 		t.Fatalf("SSH dial failed: %v", err)
 	}

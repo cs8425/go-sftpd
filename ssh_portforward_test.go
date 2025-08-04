@@ -12,11 +12,16 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+var (
+	echoServerAddr string
+	sftpServerAddr string
+)
+
 // Helper: start a test TCP echo server
-func startEchoServer(t *testing.T) (addr string, closeFn func()) {
+func startEchoServer() (addr string, closeFn func(), err error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("echo listen: %v", err)
+		return "", nil, err
 	}
 	go func() {
 		for {
@@ -30,39 +35,67 @@ func startEchoServer(t *testing.T) (addr string, closeFn func()) {
 			}(c)
 		}
 	}()
-	return ln.Addr().String(), func() { ln.Close() }
+	return ln.Addr().String(), func() { ln.Close() }, nil
+}
+
+func setupTestServer() (addr string, closeFn func(), err error) {
+	keyFile, err := os.CreateTemp("", "testkey_*.pem")
+	if err != nil {
+		return "", nil, fmt.Errorf("TempFile error: %v", err)
+	}
+	keyFile.Close()
+	if err := generateED25519Key(keyFile.Name()); err != nil {
+		return "", nil, fmt.Errorf("generateED25519Key failed: %v", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "sftproot_")
+	if err != nil {
+		return "", nil, fmt.Errorf("TempDir error: %v", err)
+	}
+	listener, err := startTestServer("127.0.0.1:0", keyFile.Name(), tmpDir)
+	closeFn = func() {
+		listener.Close()
+		os.RemoveAll(tmpDir)
+		os.Remove(keyFile.Name())
+	}
+	addr = listener.Addr().String()
+	return
+}
+
+func TestMain(m *testing.M) {
+	echoAddr, closeEcho, err := startEchoServer()
+	if err != nil {
+		fmt.Printf("error echo listen: %v", err)
+		return
+	}
+	defer closeEcho()
+	echoServerAddr = echoAddr
+
+	// init sftp server
+	sftpAddr, closeSftp, err := setupTestServer()
+	if err != nil {
+		fmt.Printf("error sftp listen: %v", err)
+		return
+	}
+	defer closeSftp()
+	sftpServerAddr = sftpAddr
+
+	// Give server a moment to start
+	time.Sleep(200 * time.Millisecond)
+
+	code := m.Run()
+
+	os.Exit(code)
 }
 
 func TestSSHLPortForward(t *testing.T) {
-	keyFile, err := os.CreateTemp("", "testkey_*.pem")
-	if err != nil {
-		t.Fatalf("TempFile error: %v", err)
-	}
-	defer os.Remove(keyFile.Name())
-	keyFile.Close()
-	if err := generateED25519Key(keyFile.Name()); err != nil {
-		t.Fatalf("generateED25519Key failed: %v", err)
-	}
-	tmpDir, err := os.MkdirTemp("", "sftproot_")
-	if err != nil {
-		t.Fatalf("TempDir error: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	listener := startTestServer(t, "127.0.0.1:0", keyFile.Name(), tmpDir)
-	defer listener.Close()
-	addr := listener.Addr().String()
-	time.Sleep(200 * time.Millisecond)
-
-	echoAddr, closeEcho := startEchoServer(t)
-	defer closeEcho()
-
 	sshConfig := &ssh.ClientConfig{
 		User:            "testuser",
 		Auth:            []ssh.AuthMethod{ssh.Password("testpass")},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         2 * time.Second,
 	}
-	client, err := ssh.Dial("tcp", addr, sshConfig)
+	client, err := ssh.Dial("tcp", sftpServerAddr, sshConfig)
 	if err != nil {
 		t.Fatalf("SSH dial failed: %v", err)
 	}
@@ -81,7 +114,7 @@ func TestSSHLPortForward(t *testing.T) {
 				return
 			}
 			go func(conn net.Conn) {
-				remote, err := client.Dial("tcp", echoAddr)
+				remote, err := client.Dial("tcp", echoServerAddr)
 				if err != nil {
 					conn.Close()
 					return
@@ -141,7 +174,7 @@ func TestSSHLPortForward(t *testing.T) {
 
 	// 使用 dialViaSocks5 測試 socks5 代理
 	socksAddr := socksListener.Addr().String()
-	socksConn, err := dialViaSocks5(echoAddr, socksAddr)
+	socksConn, err := dialViaSocks5(echoServerAddr, socksAddr)
 	if err != nil {
 		t.Fatalf("SOCKS5 dial failed: %v", err)
 	}
@@ -167,15 +200,15 @@ func TestSSHLPortForward(t *testing.T) {
 	go func() {
 		for {
 			conn, err := remoteListener.Accept()
-			Vln(0, "remote listen accept", conn, err, echoAddr)
+			Vln(0, "remote listen accept", conn, err, echoServerAddr)
 			if err != nil {
 				return
 			}
 			go func(conn net.Conn) {
 				defer conn.Close()
 				// 由 client 端連到 echoAddr
-				remote, err := net.Dial("tcp", echoAddr)
-				Vln(0, "remote listen Dial to echo", remote.RemoteAddr(), remote.LocalAddr(), err, echoAddr)
+				remote, err := net.Dial("tcp", echoServerAddr)
+				Vln(0, "remote listen Dial to echo", remote.RemoteAddr(), remote.LocalAddr(), err, echoServerAddr)
 				if err != nil {
 					return
 				}

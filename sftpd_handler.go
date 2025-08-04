@@ -204,6 +204,27 @@ func (h *RootedHandler) Lstat(r *sftp.Request) (sftp.ListerAt, error) {
 	return NewListerAt([]os.FileInfo{fis}), nil
 }
 
+var _ sftp.StatVFSFileCmder = (*RootedHandler)(nil)
+
+func (h *RootedHandler) StatVFS(*sftp.Request) (*sftp.StatVFS, error) {
+	const blockSize = 4096
+	const totalSize = 1024 * 1024 * 1024 * 1024 * 1024 // 1024TB
+	const blockCount = totalSize / blockSize
+	const inodeCount = blockCount
+	return &sftp.StatVFS{
+		Bsize:   blockSize,
+		Frsize:  blockSize,
+		Blocks:  blockCount, // total = Blocks * Frsize
+		Bfree:   blockCount, // available = Bfree * Frsize
+		Bavail:  blockCount, // for unprivileged users
+		Files:   inodeCount,
+		Ffree:   inodeCount,
+		Favail:  inodeCount,
+		Flag:    uint64(0),
+		Namemax: uint64(255), // most filesystem limit
+	}, nil
+}
+
 // pool for custom FileInfo
 var (
 	fileInfoPool = NewFileInfoPool()

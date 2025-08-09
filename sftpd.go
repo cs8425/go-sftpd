@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -106,7 +107,16 @@ type SftpSrv struct {
 	rootDir                 string
 	enablePortForward       bool
 	enableRemotePortForward bool
-	Users                   []*UserConfig
+
+	// set file permission on server (644 / 600)
+	// directory will not remove 'x'
+	hostUmask fs.FileMode
+
+	// force show file permission on client, eg: always executable (755)
+	// do OR on permission
+	clientFileMask fs.FileMode
+
+	Users []*UserConfig
 }
 
 func NewSftpSrv(config *Config) *SftpSrv {
@@ -116,6 +126,19 @@ func NewSftpSrv(config *Config) *SftpSrv {
 		enablePortForward:       config.EnablePortForward,
 		enableRemotePortForward: config.EnableRemotePortForward,
 	}
+
+	umask, err := strconv.ParseUint(config.HostFileUmask, 8, 32)
+	if err != nil {
+		umask = 0o113
+	}
+	srv.hostUmask = fs.FileMode(umask)
+
+	cfmask, err := strconv.ParseUint(config.ClientFileMask, 8, 32)
+	if err != nil {
+		cfmask = 0o511
+	}
+	srv.clientFileMask = fs.FileMode(cfmask)
+
 	srv.config = &ssh.ServerConfig{
 		PasswordCallback:  srv.PasswordAuth,
 		PublicKeyCallback: srv.PublicKeyAuth,
@@ -206,7 +229,7 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 				continue
 			}
 			Vln(3, "New session channel", channel)
-			go handleSession(channel, requests, user)
+			go srv.handleSession(channel, requests, user)
 		case "direct-tcpip":
 			if srv.enablePortForward && user.EnablePortForward {
 				go handleDirectTCPIP(newChannel)
@@ -221,14 +244,14 @@ func (srv *SftpSrv) HandleConn(conn net.Conn, rootDir string) {
 	Vln(3, "[conn]SSH connection end", conn.RemoteAddr(), sshConn)
 }
 
-func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, user *User) {
+func (srv *SftpSrv) handleSession(channel ssh.Channel, requests <-chan *ssh.Request, user *User) {
 	defer channel.Close()
 	for req := range requests {
 		Vln(3, "[session]Received request:", req.Type, req.WantReply, req.Payload)
 		switch req.Type {
 		case "subsystem":
 			if string(req.Payload[4:]) == "sftp" {
-				h, err := customSFTPHandlers(user.RootDir, user.Username)
+				h, err := customSFTPHandlers(user.RootDir, user.Username, srv.hostUmask, srv.clientFileMask)
 				if err != nil {
 					Vln(3, "[session]SFTP server init error", err)
 					req.Reply(false, nil)

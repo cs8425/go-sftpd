@@ -21,10 +21,19 @@ import (
 
 // Config represents the config file structure
 type Config struct {
-	Users                   []*UserConfig `json:"users"`
-	RootDir                 string        `json:"root,omitempty"`
-	EnablePortForward       bool          `json:"allow-port-forward,omitempty"`
-	EnableRemotePortForward bool          `json:"allow-remote-port-forward,omitempty"`
+	Users   []*UserConfig `json:"users"`
+	RootDir string        `json:"root,omitempty"`
+
+	// set file permission on server (644 / 600)
+	// directory will not remove 'x'
+	HostFileUmask string `json:"umask,omitempty"`
+
+	// force show file permission on client, eg: always executable (755)
+	// do OR on permission
+	ClientFileMask string `json:"client-mask,omitempty"`
+
+	EnablePortForward       bool `json:"allow-port-forward,omitempty"`
+	EnableRemotePortForward bool `json:"allow-remote-port-forward,omitempty"`
 }
 
 var (
@@ -39,6 +48,12 @@ func loadConfig(configPath string) (*Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+	if cfg.HostFileUmask == "" {
+		cfg.HostFileUmask = "133" // clr --x-wx-wx
+	}
+	if cfg.ClientFileMask == "" {
+		cfg.ClientFileMask = "511" // or r-x--x--x
 	}
 	return &cfg, nil
 }
@@ -177,6 +192,8 @@ func main() {
 			RootDir:                 *rootDir,
 			EnablePortForward:       *portForward,
 			EnableRemotePortForward: *remoteRortForward,
+			HostFileUmask:           "133", // 777 => 644
+			ClientFileMask:          "511", // 644 => 755
 		}
 		Vf(2, "[config]Loaded user from CLI: %s", *cliUser)
 	} else {

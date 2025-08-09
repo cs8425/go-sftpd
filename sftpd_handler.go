@@ -2,6 +2,7 @@ package main
 
 import (
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,24 @@ type RootedHandler struct {
 	root     *os.Root
 	rootDir  string
 	username string
+
+	// set file permission on server (644 / 600)
+	// directory will not remove 'x'
+	// default = 133 , remove 'x' and 'w'
+	hostUmask fs.FileMode
+
+	// force show file permission on client, eg: always executable (755)
+	// do OR on permission
+	clientFileMask fs.FileMode
+}
+
+// do the umask, directory will not remove 'x'
+func (h *RootedHandler) getHostPerm(perm fs.FileMode, isDir bool) fs.FileMode {
+	m := ^h.hostUmask
+	if isDir {
+		m |= 0o111
+	}
+	return perm & m
 }
 
 // for os.Root API, file path should not in absolute
@@ -51,7 +70,7 @@ var _ sftp.FileWriter = (*RootedHandler)(nil)
 func (h *RootedHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	path := h.cleanPath(r.Filepath)
 	Vln(3, "[Filewrite]", r.Method, r.Filepath, path)
-	return h.root.OpenFile(h.toRootPath(r.Filepath), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	return h.root.OpenFile(h.toRootPath(r.Filepath), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, h.getHostPerm(0o644, false))
 }
 
 var _ sftp.OpenFileWriter = (*RootedHandler)(nil)
@@ -81,7 +100,7 @@ func (h *RootedHandler) OpenFile(r *sftp.Request) (sftp.WriterAtReaderAt, error)
 	// if sftpFlag.Append {
 	// 	osFlag |= os.O_APPEND
 	// }
-	return h.root.OpenFile(h.toRootPath(r.Filepath), osFlag, 0644)
+	return h.root.OpenFile(h.toRootPath(r.Filepath), osFlag, h.getHostPerm(0o644, false))
 }
 
 var _ sftp.FileCmder = (*RootedHandler)(nil)
@@ -103,7 +122,7 @@ func (h *RootedHandler) Filecmd(r *sftp.Request) error {
 	case "Remove":
 		return h.root.Remove(h.toRootPath(r.Filepath))
 	case "Mkdir":
-		return h.root.Mkdir(h.toRootPath(r.Filepath), 0755)
+		return h.root.Mkdir(h.toRootPath(r.Filepath), h.getHostPerm(0o755, true))
 
 	// TODO: config for enable links
 	case "Symlink":
@@ -125,7 +144,9 @@ func (h *RootedHandler) setstat(r *sftp.Request, path string) error {
 	flags := r.AttrFlags()
 	var err error
 	if flags.Permissions {
-		err = os.Chmod(path, attr.FileMode())
+		fmod := attr.FileMode()
+		isDir := fmod.IsDir()
+		err = os.Chmod(path, h.getHostPerm(fmod, isDir))
 	}
 	// disable Chown
 	// TODO: config?
@@ -170,14 +191,14 @@ func (h *RootedHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return NewListerAt(fis), nil
+		return NewListerAt(fis, h.clientFileMask), nil
 
 	case "Stat":
 		fis, err := h.root.Stat(h.toRootPath(r.Filepath))
 		if err != nil {
 			return nil, err
 		}
-		return NewListerAt([]os.FileInfo{fis}), nil
+		return NewListerAt([]os.FileInfo{fis}, h.clientFileMask), nil
 	case "Lstat": // should call h.Lstat(r *sftp.Request) (sftp.ListerAt, error)
 		return h.Lstat(r)
 	}
@@ -201,7 +222,7 @@ func (h *RootedHandler) Lstat(r *sftp.Request) (sftp.ListerAt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewListerAt([]os.FileInfo{fis}), nil
+	return NewListerAt([]os.FileInfo{fis}, h.clientFileMask), nil
 }
 
 var _ sftp.StatVFSFileCmder = (*RootedHandler)(nil)
@@ -257,6 +278,11 @@ var _ sftp.FileInfoUidGid = (*FileInfo)(nil)
 // https://github.com/pkg/sftp/blob/master/ls_formatting.go#L44
 type FileInfo struct {
 	os.FileInfo
+	mask fs.FileMode
+}
+
+func (fi *FileInfo) Mode() os.FileMode {
+	return fi.FileInfo.Mode() | fi.mask
 }
 
 // currently hard code, maybe need config?
@@ -269,11 +295,12 @@ func (fi *FileInfo) Gid() uint32 {
 
 type listerAt []*FileInfo
 
-func NewListerAt(ls []os.FileInfo) listerAt {
+func NewListerAt(ls []os.FileInfo, fileMask fs.FileMode) listerAt {
 	lis := make([]*FileInfo, 0, len(ls))
 	for _, ofi := range ls {
 		fi := fileInfoPool.Get()
 		fi.FileInfo = ofi
+		fi.mask = fileMask
 		lis = append(lis, fi)
 	}
 	return lis
@@ -303,7 +330,7 @@ func (l listerAt) Close() error {
 	return nil
 }
 
-func customSFTPHandlers(rootDir string, username string) (*RootedHandler, error) {
+func customSFTPHandlers(rootDir string, username string, hostUmask fs.FileMode, clientFileMask fs.FileMode) (*RootedHandler, error) {
 	root, err := os.OpenRoot(rootDir)
 	if err != nil {
 		return nil, err
@@ -312,6 +339,9 @@ func customSFTPHandlers(rootDir string, username string) (*RootedHandler, error)
 		root:     root,
 		rootDir:  rootDir,
 		username: username,
+
+		hostUmask:      hostUmask,
+		clientFileMask: clientFileMask,
 	}
 	return h, nil
 }

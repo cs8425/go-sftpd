@@ -34,6 +34,8 @@ type Config struct {
 
 	EnablePortForward       bool `json:"allow-port-forward,omitempty"`
 	EnableRemotePortForward bool `json:"allow-remote-port-forward,omitempty"`
+	NoSFTPAccess            bool `json:"no-sftp,omitempty"`
+	ReadOnly                bool `json:"read-only,omitempty"`
 }
 
 var (
@@ -229,6 +231,8 @@ func main() {
 	}
 	Vln(1, "[sftpd]Listening on", *bindAddr)
 	Vln(1, "[sftpd]RootDir", serverConfig.RootDir)
+	Vln(1, "[sftpd]ReadOnly enable", serverConfig.ReadOnly)
+	Vln(1, "[sftpd]SFTP enable", !serverConfig.NoSFTPAccess)
 	Vln(1, "[sftpd]PortForward enable", serverConfig.EnablePortForward)
 	Vln(1, "[sftpd]RemotePortForward enable", serverConfig.EnableRemotePortForward)
 

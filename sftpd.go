@@ -26,6 +26,8 @@ type UserConfig struct {
 
 	EnablePortForward       bool `json:"allow-port-forward,omitempty"`
 	EnableRemotePortForward bool `json:"allow-remote-port-forward,omitempty"`
+	NoSFTPAccess            bool `json:"no-sftp,omitempty"`
+	ReadOnly                bool `json:"read-only,omitempty"`
 }
 
 func (u *UserConfig) String() string {
@@ -55,6 +57,9 @@ type User struct {
 	Username string
 	RootDir  string
 
+	ReadOnly     bool
+	NoSFTPAccess bool
+
 	EnablePortForward       bool
 	EnableRemotePortForward bool
 
@@ -66,7 +71,7 @@ type User struct {
 func (u *User) String() string {
 	u.mx.Lock()
 	defer u.mx.Unlock()
-	return fmt.Sprintf("{user=%v root=%v forward=%v remote-forward=%v ln=%v}", u.Username, u.RootDir, u.EnablePortForward, u.EnableRemotePortForward, len(u.remoteForward))
+	return fmt.Sprintf("{user=%v root=%v ro=%v no-sftp=%v forward=%v remote-forward=%v ln=%v}", u.Username, u.RootDir, u.ReadOnly, u.NoSFTPAccess, u.EnablePortForward, u.EnableRemotePortForward, len(u.remoteForward))
 }
 
 func (u *User) AddListener(ln net.Listener) {
@@ -105,6 +110,8 @@ func (u *User) Close() error {
 type SftpSrv struct {
 	config                  *ssh.ServerConfig
 	rootDir                 string
+	readOnly                bool
+	noSFTPAccess            bool
 	enablePortForward       bool
 	enableRemotePortForward bool
 
@@ -123,6 +130,8 @@ func NewSftpSrv(config *Config) *SftpSrv {
 	srv := &SftpSrv{
 		Users:                   config.Users,
 		rootDir:                 config.RootDir,
+		readOnly:                config.ReadOnly,
+		noSFTPAccess:            config.NoSFTPAccess,
 		enablePortForward:       config.EnablePortForward,
 		enableRemotePortForward: config.EnableRemotePortForward,
 	}
@@ -154,6 +163,8 @@ func (srv *SftpSrv) GetUser(name string) *User {
 			userSess := &User{
 				Username:                u.Username,
 				RootDir:                 userRootDir,
+				ReadOnly:                u.ReadOnly,
+				NoSFTPAccess:            u.NoSFTPAccess,
 				EnablePortForward:       u.EnablePortForward,
 				EnableRemotePortForward: u.EnableRemotePortForward,
 			}
@@ -250,8 +261,10 @@ func (srv *SftpSrv) handleSession(channel ssh.Channel, requests <-chan *ssh.Requ
 		Vln(3, "[session]Received request:", req.Type, req.WantReply, req.Payload)
 		switch req.Type {
 		case "subsystem":
-			if string(req.Payload[4:]) == "sftp" {
-				h, err := customSFTPHandlers(user.RootDir, user.Username, srv.hostUmask, srv.clientFileMask)
+			noSFTPAccess := srv.noSFTPAccess || user.NoSFTPAccess
+			if string(req.Payload[4:]) == "sftp" && !noSFTPAccess {
+				isRO := srv.readOnly || user.ReadOnly
+				h, err := customSFTPHandlers(user.RootDir, user.Username, srv.hostUmask, srv.clientFileMask, isRO)
 				if err != nil {
 					Vln(3, "[session]SFTP server init error", err)
 					req.Reply(false, nil)

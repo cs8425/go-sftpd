@@ -18,6 +18,7 @@ type RootedHandler struct {
 	root     *os.Root
 	rootDir  string
 	username string
+	readOnly bool
 
 	// set file permission on server (644 / 600)
 	// directory will not remove 'x'
@@ -68,6 +69,9 @@ func (h *RootedHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 var _ sftp.FileWriter = (*RootedHandler)(nil)
 
 func (h *RootedHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	if h.readOnly {
+		return nil, fs.ErrPermission
+	}
 	path := h.cleanPath(r.Filepath)
 	Vln(3, "[Filewrite]", r.Method, r.Filepath, path)
 	return h.root.OpenFile(h.toRootPath(r.Filepath), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, h.getHostPerm(0o644, false))
@@ -77,6 +81,12 @@ var _ sftp.OpenFileWriter = (*RootedHandler)(nil)
 
 func (h *RootedHandler) OpenFile(r *sftp.Request) (sftp.WriterAtReaderAt, error) {
 	sftpFlag := r.Pflags()
+	if h.readOnly {
+		sftpFlag.Write = false
+		sftpFlag.Append = false
+		sftpFlag.Creat = false
+		sftpFlag.Trunc = false
+	}
 	osFlag := 0
 	if sftpFlag.Read && sftpFlag.Write {
 		osFlag = os.O_RDWR
@@ -108,6 +118,9 @@ var _ sftp.FileCmder = (*RootedHandler)(nil)
 func (h *RootedHandler) Filecmd(r *sftp.Request) error {
 	path := h.cleanPath(r.Filepath)
 	Vln(3, "[Filecmd]", r.Method, r.Filepath, path)
+	if h.readOnly {
+		return fs.ErrPermission
+	}
 	switch r.Method {
 	case "Setstat":
 		// TODO: ensure path will be same with os.Root
@@ -330,7 +343,7 @@ func (l listerAt) Close() error {
 	return nil
 }
 
-func customSFTPHandlers(rootDir string, username string, hostUmask fs.FileMode, clientFileMask fs.FileMode) (*RootedHandler, error) {
+func customSFTPHandlers(rootDir string, username string, hostUmask fs.FileMode, clientFileMask fs.FileMode, readOnly bool) (*RootedHandler, error) {
 	root, err := os.OpenRoot(rootDir)
 	if err != nil {
 		return nil, err
@@ -339,6 +352,7 @@ func customSFTPHandlers(rootDir string, username string, hostUmask fs.FileMode, 
 		root:     root,
 		rootDir:  rootDir,
 		username: username,
+		readOnly: readOnly,
 
 		hostUmask:      hostUmask,
 		clientFileMask: clientFileMask,

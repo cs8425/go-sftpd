@@ -74,12 +74,16 @@ func (h *RootedHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	}
 	path := h.cleanPath(r.Filepath)
 	Vln(3, "[Filewrite]", r.Method, r.Filepath, path)
-	return h.root.OpenFile(h.toRootPath(r.Filepath), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, h.getHostPerm(0o644, false))
+	return h.openFile(r)
 }
 
 var _ sftp.OpenFileWriter = (*RootedHandler)(nil)
 
 func (h *RootedHandler) OpenFile(r *sftp.Request) (sftp.WriterAtReaderAt, error) {
+	return h.openFile(r)
+}
+
+func (h *RootedHandler) openFile(r *sftp.Request) (*os.File, error) {
 	sftpFlag := r.Pflags()
 	if h.readOnly {
 		sftpFlag.Write = false

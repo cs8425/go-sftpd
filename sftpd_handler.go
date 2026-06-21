@@ -127,13 +127,10 @@ func (h *RootedHandler) Filecmd(r *sftp.Request) error {
 	}
 	switch r.Method {
 	case "Setstat":
-		// TODO: ensure path will be same with os.Root
-		return h.setstat(r, path)
+		return h.setstat(r)
 	case "Rename":
-		// only in golang 1.25, not yet now
-		// h.root.Rename(r.Filepath, r.Target)
-		newPath := h.cleanPath(r.Target)
-		return os.Rename(path, newPath)
+		// only in golang 1.25+
+		return h.root.Rename(h.toRootPath(r.Filepath), h.toRootPath(r.Target))
 	case "Rmdir":
 		return h.root.Remove(h.toRootPath(r.Filepath))
 	case "Remove":
@@ -146,34 +143,45 @@ func (h *RootedHandler) Filecmd(r *sftp.Request) error {
 		// NOTE: given a POSIX compliant signature: symlink(target, linkpath string)
 		// this makes Request.Target the linkpath, and Request.Filepath the target.
 		// r.Filepath is the target, and r.Target is the linkpath.
-		// os.Symlink(h.cleanPath(r.Filepath), h.cleanPath(r.Target))
+		// return os.Symlink(h.cleanPath(r.Filepath), h.cleanPath(r.Target))
+		// return h.root.Symlink(h.toRootPath(r.Filepath), h.toRootPath(r.Target))
 	case "Link":
 	default:
 	}
 	return sftp.ErrSSHFxOpUnsupported
 }
 
-func (h *RootedHandler) setstat(r *sftp.Request, path string) error {
+func (h *RootedHandler) setstat(r *sftp.Request) error {
 	attr := r.Attributes()
 	if attr == nil {
 		return nil
 	}
+	rootPath := h.toRootPath(r.Filepath)
 	flags := r.AttrFlags()
 	var err error
 	if flags.Permissions {
 		fmod := attr.FileMode()
 		isDir := fmod.IsDir()
-		err = os.Chmod(path, h.getHostPerm(fmod, isDir))
+		// err = os.Chmod(path, h.getHostPerm(fmod, isDir))
+		// only in golang 1.25+
+		err = h.root.Chmod(rootPath, h.getHostPerm(fmod, isDir))
 	}
 	// disable Chown
 	// TODO: config?
 	// if err == nil && flags.UidGid {
 	// 	err = os.Chown(path, int(attr.UID), int(attr.GID))
+	// 	err = h.root.Chown(rootPath, int(attr.UID), int(attr.GID))
 	// }
 	if err == nil && flags.Acmodtime {
-		err = os.Chtimes(path, attr.AccessTime(), attr.ModTime())
+		// err = os.Chtimes(path, attr.AccessTime(), attr.ModTime())
+		// only in golang 1.25+
+		err = h.root.Chtimes(rootPath, attr.AccessTime(), attr.ModTime())
 	}
 	if err == nil && flags.Size {
+		// TODO: ensure path will be same with os.Root
+		path := h.cleanPath(r.Filepath)
+
+		// no os.Root api yet
 		err = os.Truncate(path, int64(attr.Size))
 	}
 	return err
@@ -225,10 +233,9 @@ func (h *RootedHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 var _ sftp.ReadlinkFileLister = (*RootedHandler)(nil)
 
 func (h *RootedHandler) Readlink(fp string) (string, error) {
-	// TODO: ensure path will be same with os.Root
-	// TODO: ensure return path not absolute and within user home(?)
-	path := h.cleanPath(fp)
-	dst, err := os.Readlink(path)
+	// dst, err := os.Readlink(h.cleanPath(fp))
+	// only in golang 1.25+
+	dst, err := h.root.Readlink(h.toRootPath(fp))
 	return dst, err
 }
 
